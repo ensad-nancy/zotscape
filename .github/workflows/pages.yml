@@ -28,6 +28,9 @@ jobs:
       - run: npm ci
       - run: npx playwright install --with-deps chromium
       - run: npm run collect
+        env:
+          GOOGLE_BOOKS_API_KEY: ${{ secrets.GOOGLE_BOOKS_API_KEY }}
+          ISBNDB_API_KEY: ${{ secrets.ISBNDB_API_KEY }}
       - run: GITHUB_PAGES=true npm run build
       - uses: actions/upload-pages-artifact@v3
         with:

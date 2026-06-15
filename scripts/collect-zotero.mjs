@@ -14,6 +14,32 @@ const fallbackDir = path.join(mediaDir, 'fallbacks');
 const cacheDir = path.join(projectRoot, '.cache');
 const assetCacheFile = path.join(cacheDir, 'zotscape-assets.json');
 
+function parseEnvLine(line) {
+  const match = String(line || '').match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/iu);
+  if (!match) return null;
+  let value = match[2].trim();
+  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+    value = value.slice(1, -1);
+  }
+  return [match[1], value];
+}
+
+async function loadLocalEnvFiles() {
+  for (const name of ['.env.local', '.env']) {
+    const text = await fs.readFile(path.join(projectRoot, name), 'utf8').catch(() => '');
+    for (const line of text.split(/\r?\n/u)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const parsed = parseEnvLine(line);
+      if (!parsed) continue;
+      const [key, value] = parsed;
+      if (process.env[key] === undefined) process.env[key] = value;
+    }
+  }
+}
+
+await loadLocalEnvFiles();
+
 const GROUP_ID = Number(process.env.ZOTSCAPE_ZOTERO_GROUP_ID || 6584095);
 const ROOT_COLLECTION_NAME = process.env.ZOTSCAPE_ROOT_COLLECTION || 'Mémoires 2026-27';
 const API_BASE = 'https://api.zotero.org';
@@ -23,6 +49,7 @@ const SKIP_SCREENSHOTS = process.env.ZOTSCAPE_SKIP_SCREENSHOTS === '1';
 const GOOGLE_BOOKS_API_KEY = process.env.GOOGLE_BOOKS_API_KEY || '';
 const USE_PUBLIC_GOOGLE_BOOKS = process.env.ZOTSCAPE_ENABLE_GOOGLE_BOOKS_PUBLIC === '1';
 const ISBNDB_API_KEY = process.env.ISBNDB_API_KEY || '';
+const COVER_PIPELINE_VERSION = 2;
 const ATLAS_WIDTH = 3200;
 const ATLAS_HEIGHT = 2200;
 
@@ -43,6 +70,7 @@ const WEB_CAPTURE_TYPES = new Set([
   'document',
   'presentation',
 ]);
+const COVER_OBJECT_TYPES = new Set(['book', 'bookSection', 'thesis']);
 
 const TYPE_LABELS = {
   artwork: 'Oeuvre',
@@ -307,13 +335,61 @@ function extractCitationKey(item) {
   return normalizeSpace(data.citationKey || data['citation-key'] || extraMatch?.[1] || '');
 }
 
+function extractCoverUrl(extra) {
+  const match = String(extra || '').match(/^\s*(?:cover|cover\s*url|cover\s*image|image\s*cover)\s*:\s*(https?:\/\/\S+)\s*$/imu);
+  return publicUrl(match?.[1] || '');
+}
+
 function parseIsbns(value) {
   const raw = String(value || '').replace(/ISBN(?:-1[03])?:?/giu, ' ');
   const matches = raw.match(/[0-9X][0-9X\-\s]{8,20}[0-9X]/giu) || [];
-  return [...new Set(matches
+  const parsed = [...new Set(matches
     .map((candidate) => candidate.replace(/[^0-9X]/giu, '').toUpperCase())
     .filter((candidate) => candidate.length === 10 || candidate.length === 13))]
     .sort((left, right) => right.length - left.length);
+  return expandIsbns(parsed);
+}
+
+function isbn10CheckDigit(firstNine) {
+  const sum = firstNine
+    .split('')
+    .reduce((total, digit, index) => total + Number(digit) * (10 - index), 0);
+  const remainder = 11 - (sum % 11);
+  if (remainder === 10) return 'X';
+  if (remainder === 11) return '0';
+  return String(remainder);
+}
+
+function isbn13CheckDigit(firstTwelve) {
+  const sum = firstTwelve
+    .split('')
+    .reduce((total, digit, index) => total + Number(digit) * (index % 2 === 0 ? 1 : 3), 0);
+  return String((10 - (sum % 10)) % 10);
+}
+
+function isbn13To10(isbn) {
+  const value = String(isbn || '').replace(/[^0-9X]/giu, '').toUpperCase();
+  if (!/^978\d{10}$/u.test(value)) return '';
+  const firstNine = value.slice(3, 12);
+  return `${firstNine}${isbn10CheckDigit(firstNine)}`;
+}
+
+function isbn10To13(isbn) {
+  const value = String(isbn || '').replace(/[^0-9X]/giu, '').toUpperCase();
+  if (!/^\d{9}[0-9X]$/u.test(value)) return '';
+  const firstTwelve = `978${value.slice(0, 9)}`;
+  return `${firstTwelve}${isbn13CheckDigit(firstTwelve)}`;
+}
+
+function expandIsbns(isbns = []) {
+  const expanded = new Set();
+  for (const isbn of isbns) {
+    if (!isbn) continue;
+    expanded.add(isbn);
+    const converted = isbn.length === 13 ? isbn13To10(isbn) : isbn10To13(isbn);
+    if (converted) expanded.add(converted);
+  }
+  return [...expanded].sort((left, right) => right.length - left.length || left.localeCompare(right));
 }
 
 const COVER_STOP_WORDS = new Set([
@@ -341,7 +417,11 @@ function significantTokens(value) {
 
 function creatorMatchTokens(reference) {
   return [...new Set((reference.creators || [])
-    .flatMap((creator) => significantTokens(creator.sortName || creator.name).slice(-1))
+    .flatMap((creator) => {
+      const sortName = String(creator.sortName || '');
+      if (sortName.includes(',')) return significantTokens(sortName.split(',')[0]);
+      return significantTokens(creator.name).slice(-1);
+    })
     .filter(Boolean))];
 }
 
@@ -363,6 +443,13 @@ function creatorOverlapScore(reference, candidateAuthors = []) {
 function hasReferenceIsbn(reference, candidateIsbns = []) {
   const normalized = new Set((candidateIsbns || []).map((isbn) => String(isbn).replace(/[^0-9X]/giu, '').toUpperCase()));
   return reference.isbns.some((isbn) => normalized.has(isbn));
+}
+
+function titlePrefixMatch(reference, candidateTitle) {
+  const referenceTitle = normalizeForMatch(reference.title);
+  const candidate = normalizeForMatch(candidateTitle);
+  if (candidate.length < 8) return false;
+  return referenceTitle.startsWith(candidate) || candidate.startsWith(referenceTitle);
 }
 
 function coverSearchQueries(reference) {
@@ -447,6 +534,18 @@ function linkHref(html, typePattern) {
   return '';
 }
 
+function relationLinkHref(html, relationPattern) {
+  const links = html.match(/<link\b[^>]*>/giu) || [];
+  for (const tag of links) {
+    const relation = getAttribute(tag, 'rel');
+    if (relationPattern.test(relation)) {
+      const href = getAttribute(tag, 'href');
+      if (href) return href;
+    }
+  }
+  return '';
+}
+
 function extractIframeSrc(html, base) {
   const iframe = String(html || '').match(/<iframe\b[^>]*>/iu)?.[0] || '';
   const src = getAttribute(iframe, 'src');
@@ -486,6 +585,18 @@ function hashIndex(value, modulo) {
     hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
   }
   return modulo ? hash % modulo : hash;
+}
+
+async function fetchJson(url, options = {}) {
+  const response = await fetchWithRetry(url, {
+    headers: {
+      Accept: 'application/json',
+      ...(options.headers || {}),
+    },
+    signal: AbortSignal.timeout(options.timeout || 30_000),
+  }, options.attempts || 2).catch(() => null);
+  if (!response?.ok) return null;
+  return response.json().catch(() => null);
 }
 
 function wrapText(text, maxChars, maxLines) {
@@ -630,13 +741,39 @@ async function downloadImage(url, targetBasePath, options = {}) {
   return filePath;
 }
 
-function coverAsset(filePath, source, identifier) {
+async function imageDimensions(filePath) {
+  const sharpModule = await import('sharp').catch(() => null);
+  const sharp = sharpModule?.default || sharpModule;
+  if (!sharp) return {};
+  const metadata = await sharp(filePath).metadata().catch(() => null);
+  if (!metadata?.width || !metadata?.height) return {};
+  return {
+    width: metadata.width,
+    height: metadata.height,
+    ratio: Number((metadata.width / metadata.height).toFixed(4)),
+  };
+}
+
+async function coverAsset(filePath, source, identifier) {
   return {
     kind: 'cover',
     src: mediaPath(filePath),
     source,
     identifier,
+    ...await imageDimensions(filePath),
   };
+}
+
+async function downloadOpenLibraryCoverById(reference, coverId, source) {
+  if (!coverId) return null;
+  const url = `https://covers.openlibrary.org/b/id/${encodeURIComponent(String(coverId))}-L.jpg?default=false`;
+  const filePath = await downloadImage(
+    url,
+    path.join(coverDir, `${reference.key}-${source}-${coverId}`),
+    { role: 'cover' },
+  ).catch(() => null);
+  if (!filePath) return null;
+  return coverAsset(filePath, source, String(coverId));
 }
 
 async function findOpenLibraryCover(reference) {
@@ -644,10 +781,71 @@ async function findOpenLibraryCover(reference) {
     const url = `https://covers.openlibrary.org/b/isbn/${encodeURIComponent(isbn)}-L.jpg?default=false`;
     const filePath = await downloadImage(url, path.join(coverDir, `${reference.key}-openlibrary-${isbn}`), { role: 'cover' }).catch(() => null);
     if (filePath) {
-      return coverAsset(filePath, 'openlibrary-isbn', isbn);
+      return await coverAsset(filePath, 'openlibrary-isbn', isbn);
     }
   }
   return null;
+}
+
+async function findOpenLibraryRelatedEditionCover(reference) {
+  const seenWorks = new Set();
+  const seenCovers = new Set();
+
+  for (const isbn of reference.isbns) {
+    const edition = await fetchJson(`https://openlibrary.org/isbn/${encodeURIComponent(isbn)}.json`);
+    if (!edition) continue;
+
+    for (const coverId of edition.covers || []) {
+      if (seenCovers.has(String(coverId))) continue;
+      seenCovers.add(String(coverId));
+      const asset = await downloadOpenLibraryCoverById(reference, coverId, 'openlibrary-edition');
+      if (asset) return asset;
+    }
+
+    for (const work of edition.works || []) {
+      const workKey = String(work?.key || '');
+      if (!workKey.startsWith('/works/') || seenWorks.has(workKey)) continue;
+      seenWorks.add(workKey);
+      const editionsUrl = new URL(`https://openlibrary.org${workKey}/editions.json`);
+      editionsUrl.searchParams.set('limit', '35');
+      const editions = await fetchJson(editionsUrl);
+      const entries = Array.isArray(editions?.entries) ? editions.entries : [];
+      const rankedEntries = entries
+        .filter((entry) => Array.isArray(entry.covers) && entry.covers.length)
+        .map((entry, index) => {
+          const candidateIsbns = [...(entry.isbn_13 || []), ...(entry.isbn_10 || [])];
+          const isbnMatch = hasReferenceIsbn(reference, candidateIsbns);
+          const titleScore = titleOverlapScore(reference, entry.title || edition.title || '');
+          const yearMatch = reference.year && String(entry.publish_date || '').includes(reference.year);
+          return {
+            entry,
+            score: (isbnMatch ? 10 : 0) + titleScore * 4 + (yearMatch ? 1 : 0) - index * 0.02,
+          };
+        })
+        .sort((left, right) => right.score - left.score);
+
+      for (const ranked of rankedEntries.slice(0, 8)) {
+        for (const coverId of ranked.entry.covers || []) {
+          if (seenCovers.has(String(coverId))) continue;
+          seenCovers.add(String(coverId));
+          const asset = await downloadOpenLibraryCoverById(reference, coverId, 'openlibrary-work-edition');
+          if (asset) return asset;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+async function findManualCover(reference) {
+  if (!reference.coverUrl) return null;
+  const filePath = await downloadImage(
+    reference.coverUrl,
+    path.join(coverDir, `${reference.key}-manual-cover`),
+    { role: 'cover' },
+  ).catch(() => null);
+  if (!filePath) return null;
+  return await coverAsset(filePath, 'zotero-extra-cover', reference.coverUrl);
 }
 
 async function findOpenLibrarySearchCover(reference) {
@@ -666,9 +864,10 @@ async function findOpenLibrarySearchCover(reference) {
       if (!doc?.cover_i) continue;
       const isbnMatch = hasReferenceIsbn(reference, doc.isbn || []);
       const titleScore = titleOverlapScore(reference, doc.title);
+      const prefixMatch = titlePrefixMatch(reference, doc.title);
       const creatorScore = creatorOverlapScore(reference, doc.author_name || []);
       const creatorTarget = Math.min(2, Math.max(1, creatorMatchTokens(reference).length));
-      const isStrongTitleMatch = titleScore >= 0.45 && creatorScore >= 1;
+      const isStrongTitleMatch = (titleScore >= 0.45 || prefixMatch) && creatorScore >= 1;
       const isLikelyTranslation = index === 0 && creatorScore >= creatorTarget && Number(payload?.numFound || 0) <= 24;
       if (!isbnMatch && !isStrongTitleMatch && !isLikelyTranslation) continue;
       const coverUrl = `https://covers.openlibrary.org/b/id/${encodeURIComponent(doc.cover_i)}-L.jpg?default=false`;
@@ -678,7 +877,7 @@ async function findOpenLibrarySearchCover(reference) {
         { role: 'cover' },
       ).catch(() => null);
       if (filePath) {
-        return coverAsset(filePath, isbnMatch ? 'openlibrary-search-isbn' : 'openlibrary-search', String(doc.cover_i));
+        return await coverAsset(filePath, isbnMatch ? 'openlibrary-search-isbn' : 'openlibrary-search', String(doc.cover_i));
       }
     }
   }
@@ -690,54 +889,313 @@ async function findGoogleBooksCover(reference) {
   for (const isbn of reference.isbns) {
     const url = new URL('https://www.googleapis.com/books/v1/volumes');
     url.searchParams.set('q', `isbn:${isbn}`);
-    url.searchParams.set('maxResults', '1');
+    url.searchParams.set('maxResults', '10');
     url.searchParams.set('projection', 'lite');
     if (GOOGLE_BOOKS_API_KEY) url.searchParams.set('key', GOOGLE_BOOKS_API_KEY);
     const response = await fetchWithRetry(url, { signal: AbortSignal.timeout(30_000) }, 2).catch(() => null);
     if (!response?.ok) continue;
     const payload = await response.json().catch(() => null);
-    const links = payload?.items?.[0]?.volumeInfo?.imageLinks || {};
-    const imageUrl = publicUrl(links.extraLarge || links.large || links.medium || links.thumbnail || links.smallThumbnail);
-    if (!imageUrl) continue;
-    const filePath = await downloadImage(imageUrl.replace(/^http:/u, 'https:'), path.join(coverDir, `${reference.key}-google-${isbn}`), { role: 'cover' }).catch(() => null);
-    if (filePath) {
-      return coverAsset(filePath, 'google-books-isbn', isbn);
+    const items = Array.isArray(payload?.items) ? payload.items : [];
+    for (const item of items) {
+      const info = item.volumeInfo || {};
+      const links = info.imageLinks || {};
+      for (const imageUrl of googleBooksImageUrls(links)) {
+        const filePath = await downloadImage(imageUrl, path.join(coverDir, `${reference.key}-google-${isbn}-${item.id || hashIndex(imageUrl)}`), { role: 'cover' }).catch(() => null);
+        if (filePath) {
+          return await coverAsset(filePath, 'google-books-isbn', isbn);
+        }
+      }
     }
   }
   return null;
 }
 
+function googleBooksQueries(reference) {
+  const authors = primaryCreators(reference.creators || []).map((creator) => creator.name).filter(Boolean);
+  const firstAuthor = authors[0] || '';
+  const shortTitle = normalizeSpace(reference.shortTitle || reference.title.split(/[:.;!?—–-]/u)[0] || reference.title);
+  const titleTokens = significantTokens(reference.title).slice(0, 5).join(' ');
+  return [...new Set([
+    ...reference.isbns.map((isbn) => `isbn:${isbn}`),
+    shortTitle && firstAuthor ? `intitle:"${shortTitle}" inauthor:"${firstAuthor}"` : '',
+    reference.publisher && shortTitle ? `intitle:"${shortTitle}" inpublisher:"${reference.publisher}"` : '',
+    [shortTitle, firstAuthor].filter(Boolean).join(' '),
+    [titleTokens, firstAuthor].filter(Boolean).join(' '),
+    [reference.title, firstAuthor].filter(Boolean).join(' '),
+  ].map(normalizeSpace).filter(Boolean))];
+}
+
+function upgradeGoogleBooksImageUrl(value) {
+  const url = publicUrl(String(value || '').replace(/^http:/u, 'https:'));
+  if (!url) return '';
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname.endsWith('google.com') || parsed.hostname.endsWith('googleusercontent.com')) {
+      if (parsed.searchParams.has('zoom')) parsed.searchParams.set('zoom', '0');
+      parsed.searchParams.delete('edge');
+    }
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+}
+
+function googleBooksImageUrls(links = {}) {
+  const values = [
+    links.extraLarge,
+    links.large,
+    links.medium,
+    links.thumbnail,
+    links.smallThumbnail,
+  ].map((value) => publicUrl(String(value || '').replace(/^http:/u, 'https:'))).filter(Boolean);
+  const urls = [];
+  for (const value of values) {
+    const upgraded = upgradeGoogleBooksImageUrl(value);
+    if (upgraded) urls.push(upgraded);
+    urls.push(value);
+  }
+  return [...new Set(urls)];
+}
+
+function googleBookScore(reference, info = {}) {
+  const candidateIsbns = (info.industryIdentifiers || []).map((identifier) => identifier.identifier);
+  const isbnMatch = hasReferenceIsbn(reference, candidateIsbns);
+  const titleScore = titleOverlapScore(reference, info.title || '');
+  const prefixMatch = titlePrefixMatch(reference, info.title || '');
+  const creatorScore = creatorOverlapScore(reference, info.authors || []);
+  const publisherScore = reference.publisher && normalizeForMatch(info.publisher).includes(normalizeForMatch(reference.publisher)) ? 1 : 0;
+  const yearScore = reference.year && String(info.publishedDate || '').startsWith(reference.year) ? 1 : 0;
+  return (isbnMatch ? 10 : 0)
+    + titleScore * 5
+    + (prefixMatch ? 2 : 0)
+    + Math.min(2, creatorScore) * 2
+    + publisherScore
+    + yearScore;
+}
+
 async function findGoogleBooksSearchCover(reference) {
   if (!GOOGLE_BOOKS_API_KEY && !USE_PUBLIC_GOOGLE_BOOKS) return null;
-  const query = [reference.title, ...(reference.creators || []).map((creator) => creator.name)].filter(Boolean).join(' ');
-  if (!query) return null;
-  const url = new URL('https://www.googleapis.com/books/v1/volumes');
-  url.searchParams.set('q', query);
-  url.searchParams.set('maxResults', '5');
-  url.searchParams.set('projection', 'lite');
-  if (GOOGLE_BOOKS_API_KEY) url.searchParams.set('key', GOOGLE_BOOKS_API_KEY);
-  const response = await fetchWithRetry(url, { signal: AbortSignal.timeout(30_000) }, 2).catch(() => null);
-  if (!response?.ok) return null;
-  const payload = await response.json().catch(() => null);
-  for (const item of payload?.items || []) {
-    const info = item.volumeInfo || {};
-    const isbnMatch = hasReferenceIsbn(
-      reference,
-      (info.industryIdentifiers || []).map((identifier) => identifier.identifier),
-    );
-    const titleScore = titleOverlapScore(reference, info.title);
-    const creatorScore = creatorOverlapScore(reference, info.authors || []);
-    if (!isbnMatch && !(titleScore >= 0.45 && creatorScore >= 1)) continue;
-    const links = info.imageLinks || {};
-    const imageUrl = publicUrl(links.extraLarge || links.large || links.medium || links.thumbnail || links.smallThumbnail);
-    if (!imageUrl) continue;
+  const candidates = [];
+  for (const query of googleBooksQueries(reference)) {
+    const url = new URL('https://www.googleapis.com/books/v1/volumes');
+    url.searchParams.set('q', query);
+    url.searchParams.set('maxResults', '10');
+    url.searchParams.set('projection', 'lite');
+    if (GOOGLE_BOOKS_API_KEY) url.searchParams.set('key', GOOGLE_BOOKS_API_KEY);
+    const response = await fetchWithRetry(url, { signal: AbortSignal.timeout(30_000) }, 2).catch(() => null);
+    if (!response?.ok) continue;
+    const payload = await response.json().catch(() => null);
+    for (const item of payload?.items || []) {
+      const info = item.volumeInfo || {};
+      const links = info.imageLinks || {};
+      const imageUrls = googleBooksImageUrls(links);
+      if (!imageUrls.length) continue;
+      const score = googleBookScore(reference, info);
+      if (score < (reference.isbns.length ? 5 : 6)) continue;
+      for (const imageUrl of imageUrls) candidates.push({ item, imageUrl, score });
+    }
+  }
+  candidates.sort((left, right) => right.score - left.score);
+  for (const candidate of candidates.slice(0, 10)) {
     const filePath = await downloadImage(
-      imageUrl.replace(/^http:/u, 'https:'),
-      path.join(coverDir, `${reference.key}-google-search-${item.id || hashIndex(query)}`),
+      candidate.imageUrl,
+      path.join(coverDir, `${reference.key}-google-search-${candidate.item.id || hashIndex(candidate.imageUrl)}`),
       { role: 'cover' },
     ).catch(() => null);
-    if (filePath) return coverAsset(filePath, isbnMatch ? 'google-books-search-isbn' : 'google-books-search', item.id || '');
+    if (filePath) {
+      const info = candidate.item.volumeInfo || {};
+      const isbnMatch = hasReferenceIsbn(reference, (info.industryIdentifiers || []).map((identifier) => identifier.identifier));
+      return await coverAsset(filePath, isbnMatch ? 'google-books-search-isbn' : 'google-books-search', candidate.item.id || '');
+    }
   }
+  return null;
+}
+
+const COVER_IMAGE_GOOD_WORDS = [
+  'book',
+  'cover',
+  'couverture',
+  'frontcover',
+  'jacket',
+  'livre',
+  'ouvrage',
+  'product',
+  '978',
+  '979',
+];
+
+const COVER_IMAGE_BAD_WORDS = [
+  'avatar',
+  'banner',
+  'captcha',
+  'favicon',
+  'footer',
+  'header',
+  'icon',
+  'logo',
+  'placeholder',
+  'profile',
+  'sprite',
+  'transparent',
+  'twitter',
+];
+
+function extractSrcsetUrl(value, base) {
+  const candidates = String(value || '')
+    .split(',')
+    .map((part) => part.trim().split(/\s+/u)[0])
+    .filter(Boolean);
+  return absoluteUrl(candidates.at(-1), base);
+}
+
+function jsonLdScriptBlocks(html) {
+  const blocks = [];
+  const pattern = /<script\b(?=[^>]*type=['"]application\/ld\+json['"])[^>]*>([\s\S]*?)<\/script>/giu;
+  let match = pattern.exec(String(html || ''));
+  while (match) {
+    blocks.push(decodeHtml(match[1]).trim());
+    match = pattern.exec(String(html || ''));
+  }
+  return blocks;
+}
+
+function parseJsonLd(block) {
+  try {
+    return JSON.parse(block);
+  } catch {
+    return null;
+  }
+}
+
+function collectImageValues(value, base, output, source, context = '') {
+  if (!value) return;
+  if (typeof value === 'string') {
+    const url = absoluteUrl(value, base);
+    if (url) output.push({ url, source, context });
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((entry) => collectImageValues(entry, base, output, source, context));
+    return;
+  }
+  if (typeof value === 'object') {
+    collectImageValues(value.url || value.contentUrl || value.thumbnailUrl, base, output, source, context);
+  }
+}
+
+function collectJsonLdCoverCandidates(node, base, output, depth = 0, inheritedContext = '') {
+  if (!node || depth > 5) return;
+  if (Array.isArray(node)) {
+    node.forEach((entry) => collectJsonLdCoverCandidates(entry, base, output, depth + 1, inheritedContext));
+    return;
+  }
+  if (typeof node !== 'object') return;
+  const type = Array.isArray(node['@type']) ? node['@type'].join(' ') : String(node['@type'] || '');
+  const context = normalizeSpace([inheritedContext, type, node.name, node.title, node.author?.name].filter(Boolean).join(' '));
+  collectImageValues(node.image, base, output, 'json-ld', context);
+  collectImageValues(node.thumbnailUrl, base, output, 'json-ld', context);
+  collectImageValues(node.primaryImageOfPage, base, output, 'json-ld', context);
+  for (const key of ['@graph', 'mainEntity', 'workExample', 'exampleOfWork', 'offers', 'hasPart', 'isPartOf']) {
+    collectJsonLdCoverCandidates(node[key], base, output, depth + 1, context);
+  }
+}
+
+function imageContextScore(reference, candidate) {
+  const normalized = normalizeForMatch(`${candidate.url} ${candidate.context || ''} ${candidate.source || ''}`);
+  let score = 0;
+  if (candidate.source === 'json-ld') score += 5;
+  if (candidate.source === 'open-graph') score += 4;
+  if (candidate.source === 'twitter') score += 3;
+  if (candidate.source === 'image-src') score += 2;
+  for (const word of COVER_IMAGE_GOOD_WORDS) {
+    if (normalized.includes(word)) score += 1.25;
+  }
+  for (const word of COVER_IMAGE_BAD_WORDS) {
+    if (normalized.includes(word)) score -= 4;
+  }
+  for (const isbn of reference.isbns || []) {
+    if (isbn.length >= 10 && normalized.includes(isbn.toLowerCase())) score += 5;
+  }
+  for (const token of significantTokens(reference.title).slice(0, 5)) {
+    if (normalized.includes(token)) score += 0.85;
+  }
+  for (const token of creatorMatchTokens(reference).slice(0, 3)) {
+    if (normalized.includes(token)) score += 0.8;
+  }
+  return score;
+}
+
+function extractPageCoverCandidates(reference, html) {
+  const base = publicUrl(reference.url);
+  if (!base) return [];
+  const candidates = [];
+  const add = (url, source, context = '') => {
+    const absolute = absoluteUrl(url, base);
+    if (absolute) candidates.push({ url: absolute, source, context });
+  };
+
+  add(metaContent(html, ['og:image:secure_url', 'og:image']), 'open-graph', metaContent(html, ['og:title', 'twitter:title']));
+  add(metaContent(html, ['twitter:image:src', 'twitter:image']), 'twitter', metaContent(html, ['twitter:title', 'og:title']));
+  add(relationLinkHref(html, /(?:^|\s)image_src(?:\s|$)/iu), 'image-src');
+
+  for (const block of jsonLdScriptBlocks(html)) {
+    const parsed = parseJsonLd(block);
+    collectJsonLdCoverCandidates(parsed, base, candidates);
+  }
+
+  const imageTags = html.match(/<img\b[^>]*>/giu) || [];
+  for (const tag of imageTags.slice(0, 80)) {
+    const src = getAttribute(tag, 'data-src')
+      || getAttribute(tag, 'data-lazy-src')
+      || getAttribute(tag, 'data-original')
+      || getAttribute(tag, 'src')
+      || extractSrcsetUrl(getAttribute(tag, 'srcset') || getAttribute(tag, 'data-srcset'), base);
+    const context = [
+      getAttribute(tag, 'alt'),
+      getAttribute(tag, 'title'),
+      getAttribute(tag, 'class'),
+      getAttribute(tag, 'id'),
+    ].filter(Boolean).join(' ');
+    add(src, 'img', context);
+  }
+
+  const byUrl = new Map();
+  for (const candidate of candidates) {
+    if (!candidate.url) continue;
+    const existing = byUrl.get(candidate.url);
+    const score = imageContextScore(reference, candidate);
+    if (!existing || score > existing.score) byUrl.set(candidate.url, { ...candidate, score });
+  }
+  return [...byUrl.values()]
+    .filter((candidate) => candidate.score >= 2.5)
+    .sort((left, right) => right.score - left.score)
+    .slice(0, 12);
+}
+
+async function findPageCover(reference, html, assetCache) {
+  if (!COVER_OBJECT_TYPES.has(reference.itemType) || !reference.url || !html) return null;
+  const cacheKey = `${COVER_PIPELINE_VERSION}:${reference.key}:${reference.version}:${reference.url}`;
+  assetCache.pageCovers ||= {};
+  const cached = assetCache.pageCovers[reference.key];
+  if (cached?.cacheKey === cacheKey) {
+    if (!cached.asset?.src) return null;
+    const filePath = path.join(publicRoot, cached.asset.src);
+    if (await exists(filePath) && await imageLooksUsable(filePath, 'cover')) return cached.asset;
+  }
+
+  const candidates = extractPageCoverCandidates(reference, html);
+  for (const candidate of candidates) {
+    const filePath = await downloadImage(
+      candidate.url,
+      path.join(coverDir, `${reference.key}-page-cover-${hashIndex(candidate.url)}`),
+      { role: 'cover' },
+    ).catch(() => null);
+    if (!filePath) continue;
+    const asset = await coverAsset(filePath, `source-page-${candidate.source}`, candidate.url);
+    assetCache.pageCovers[reference.key] = { cacheKey, asset };
+    return asset;
+  }
+  assetCache.pageCovers[reference.key] = { cacheKey, asset: null };
   return null;
 }
 
@@ -755,24 +1213,31 @@ async function findIsbnDbCover(reference) {
     if (!imageUrl) continue;
     const filePath = await downloadImage(imageUrl.replace(/^http:/u, 'https:'), path.join(coverDir, `${reference.key}-isbndb-${isbn}`), { role: 'cover' }).catch(() => null);
     if (filePath) {
-      return coverAsset(filePath, 'isbndb', isbn);
+      return await coverAsset(filePath, 'isbndb', isbn);
     }
   }
   return null;
 }
 
 async function enrichCover(reference, assetCache) {
-  const cacheKey = `${reference.key}:${reference.version}:${reference.isbns.join(',')}`;
+  const cacheKey = `${COVER_PIPELINE_VERSION}:${reference.key}:${reference.version}:${reference.isbns.join(',')}:${reference.coverUrl || ''}`;
   const cached = assetCache.covers?.[reference.key];
   if (cached?.cacheKey && cached.cacheKey === cacheKey && cached.asset?.src) {
     const filePath = path.join(publicRoot, cached.asset.src);
-    if (await exists(filePath) && await imageLooksUsable(filePath, 'cover')) return cached.asset;
+    if (await exists(filePath) && await imageLooksUsable(filePath, 'cover')) {
+      if (!cached.asset.width || !cached.asset.height) {
+        cached.asset = { ...cached.asset, ...await imageDimensions(filePath) };
+      }
+      return cached.asset;
+    }
   }
   const canSearchByTitle = ['book', 'bookSection', 'thesis'].includes(reference.itemType)
     && reference.title
     && (reference.creators || []).length;
-  if (!reference.isbns.length && !canSearchByTitle) return null;
-  const asset = await findOpenLibraryCover(reference)
+  if (!reference.coverUrl && !reference.isbns.length && !canSearchByTitle) return null;
+  const asset = await findManualCover(reference)
+    || await findOpenLibraryCover(reference)
+    || await findOpenLibraryRelatedEditionCover(reference)
     || await findOpenLibrarySearchCover(reference)
     || await findGoogleBooksCover(reference)
     || await findGoogleBooksSearchCover(reference)
@@ -1101,6 +1566,7 @@ function normalizeReference(item, context) {
     language: normalizeSpace(data.language || ''),
     isbn: normalizeSpace(data.ISBN || ''),
     isbns: parseIsbns(data.ISBN),
+    coverUrl: extractCoverUrl(data.extra),
     doi: normalizeSpace(data.DOI || ''),
     doiUrl: getDoiUrl(data.DOI || ''),
     url,
@@ -1152,6 +1618,9 @@ function computeMemoirStats(memoir, references) {
 }
 
 function chooseCardAsset(reference) {
+  if (COVER_OBJECT_TYPES.has(reference.itemType)) {
+    return reference.cover || reference.fallback || reference.embed?.thumbnail || reference.openGraph?.image || reference.archive?.asset || reference.screenshot;
+  }
   return reference.cover
     || reference.embed?.thumbnail
     || reference.openGraph?.image
@@ -1162,6 +1631,7 @@ function chooseCardAsset(reference) {
 
 function shouldCaptureVisual(reference) {
   if (!reference.url) return false;
+  if (COVER_OBJECT_TYPES.has(reference.itemType)) return false;
   if (reference.cover || reference.embed?.thumbnail || reference.openGraph?.image || reference.archive?.asset) return false;
   if (reference.publicPdfUrl) return !reference.cover;
   return WEB_CAPTURE_TYPES.has(reference.itemType) || !reference.cover;
@@ -1241,6 +1711,7 @@ async function main() {
 
   const assetCache = {
     covers: {},
+    pageCovers: {},
     embeds: {},
     openGraph: {},
     previews: {},
@@ -1249,6 +1720,7 @@ async function main() {
     ...(await readJson(assetCacheFile, {})),
   };
   assetCache.covers ||= {};
+  assetCache.pageCovers ||= {};
   assetCache.embeds ||= {};
   assetCache.openGraph ||= {};
   assetCache.previews ||= {};
@@ -1335,6 +1807,9 @@ async function main() {
       reason: page.blocked ? 'blocked-live-page' : '',
     };
     if (!page.blocked && page.html) {
+      if (!reference.cover && COVER_OBJECT_TYPES.has(reference.itemType)) {
+        reference.cover = await findPageCover(reference, page.html, assetCache);
+      }
       reference.embed = await enrichOembed(reference, page.html, assetCache);
       reference.openGraph = await enrichOpenGraph(reference, page.html, assetCache);
     }
@@ -1346,7 +1821,13 @@ async function main() {
   const screenshotTools = await loadScreenshotTools();
   if (screenshotTools) {
     let captured = 0;
-    const captureCandidates = references.filter((reference) => reference.url && !reference.cover && !reference.embed?.thumbnail && !reference.openGraph?.image);
+    const captureCandidates = references.filter((reference) => (
+      reference.url
+      && !COVER_OBJECT_TYPES.has(reference.itemType)
+      && !reference.cover
+      && !reference.embed?.thumbnail
+      && !reference.openGraph?.image
+    ));
     log(`Capturing up to ${SCREENSHOT_LIMIT} final preview fallbacks...`);
     for (const reference of captureCandidates) {
       if (captured >= SCREENSHOT_LIMIT) break;

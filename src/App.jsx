@@ -162,11 +162,28 @@ function supportType(reference) {
 
 function objectDimensions(reference) {
   const type = supportType(reference);
+  const assetKind = reference.asset?.kind || 'fallback';
   const shared = reference.memoirKeys?.length > 1;
   const seed = hashValue(reference.key || reference.title);
   const scale = (shared ? 1.04 : 1) * ([0.96, 1, 1.04][seed % 3]);
   const captionHeight = 66;
   const gap = 12;
+  if (assetKind === 'cover' && ['book', 'chapter', 'thesis'].includes(type)) {
+    const ratio = clamp(Number(reference.asset?.ratio || 0.66), 0.42, 0.9);
+    const mediaHeightBase = {
+      book: shared ? 372 : 346,
+      chapter: shared ? 336 : 312,
+      thesis: shared ? 370 : 344,
+    }[type];
+    const mediaHeight = Math.round(mediaHeightBase * scale);
+    const width = Math.round(clamp(mediaHeight * ratio + 14, type === 'chapter' ? 176 : 190, type === 'thesis' ? 290 : 300));
+    return {
+      width,
+      height: mediaHeight + gap + captionHeight,
+      mediaHeight,
+      captionHeight,
+    };
+  }
   const dimensions = {
     article: { width: 286, mediaHeight: 332 },
     book: { width: 226, mediaHeight: 324 },
