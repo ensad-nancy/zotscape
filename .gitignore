@@ -6,3 +6,6 @@ dist/
 npm-debug.log*
 .env
 .env.local
+public/data
+public/media
+*.webp

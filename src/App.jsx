@@ -1,22 +1,34 @@
 import { useEffect, useMemo, useState } from 'react';
+import { TransformComponent, TransformWrapper } from 'react-zoom-pan-pinch';
 import {
   ArrowUpRight,
   BookOpen,
   CalendarDays,
   FileText,
-  Filter,
   Globe2,
   Highlighter,
-  Layers3,
   Library,
   Link2,
+  Play,
+  RotateCcw,
   Search,
-  Sparkles,
+  SlidersHorizontal,
   UsersRound,
   X,
 } from 'lucide-react';
 
 const BASE_URL = import.meta.env.BASE_URL || '/';
+const DEFAULT_LAYOUT = { width: 1800, height: 1200 };
+
+const ASSET_LABELS = {
+  archive: 'Archive web',
+  cover: 'Couverture',
+  fallback: 'Carton de référence',
+  oembed: 'Média intégré',
+  'open-graph': 'Image du site',
+  'pdf-screenshot': 'PDF public',
+  screenshot: 'Capture',
+};
 
 function assetUrl(src = '') {
   if (!src) return '';
@@ -39,8 +51,6 @@ function formatUpdated(value) {
       day: '2-digit',
       month: 'short',
       year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
     }).format(new Date(value));
   } catch {
     return '';
@@ -57,7 +67,6 @@ function getSearchBlob(reference) {
     reference.publicationTitle,
     reference.bookTitle,
     reference.abstract,
-    reference.citationKey,
     ...(reference.tags || []),
     ...(reference.memoirNames || []),
   ].filter(Boolean).join(' '));
@@ -91,199 +100,408 @@ function referenceMatchesFeature(reference, feature) {
   return true;
 }
 
-function sortReferences(references, sortMode) {
-  const sorted = [...references];
-  if (sortMode === 'year-desc') {
-    sorted.sort((left, right) => Number(right.year || 0) - Number(left.year || 0) || left.title.localeCompare(right.title, 'fr'));
-  } else if (sortMode === 'shared') {
-    sorted.sort((left, right) => (right.memoirKeys?.length || 0) - (left.memoirKeys?.length || 0) || left.title.localeCompare(right.title, 'fr'));
-  } else if (sortMode === 'type') {
-    sorted.sort((left, right) => (left.typeLabel || '').localeCompare(right.typeLabel || '', 'fr') || left.title.localeCompare(right.title, 'fr'));
-  } else {
-    sorted.sort((left, right) => left.title.localeCompare(right.title, 'fr'));
-  }
-  return sorted;
+function activeToolCount({ activeMemoir, query, typeFilter, yearFilter, featureFilters }) {
+  return [
+    activeMemoir,
+    query,
+    typeFilter,
+    yearFilter,
+    featureFilters.size,
+  ].filter(Boolean).length;
 }
 
-function Stat({ icon: Icon, label, value }) {
-  return (
-    <div className="stat">
-      <Icon size={17} aria-hidden="true" />
-      <span className="stat-value">{value}</span>
-      <span className="stat-label">{label}</span>
-    </div>
-  );
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
 }
 
-function MemoirButton({ memoir, active, onClick }) {
-  return (
-    <button className={`memoir-button${active ? ' is-active' : ''}`} type="button" onClick={onClick}>
-      <span className="memoir-name">{memoir.name}</span>
-      <span className="memoir-meta">
-        <span>{memoir.referenceCount} refs</span>
-        {memoir.sharedReferenceCount > 0 && <span>{memoir.sharedReferenceCount} croisées</span>}
-      </span>
-      <span className="type-ribbons" aria-hidden="true">
-        {(memoir.dominantTypes || []).slice(0, 3).map((entry) => (
-          <span key={entry.type} title={`${entry.label}: ${entry.count}`} />
-        ))}
-      </span>
-    </button>
-  );
+function supportType(reference) {
+  if (reference.itemType === 'book') return 'book';
+  if (reference.itemType === 'bookSection') return 'chapter';
+  if (reference.itemType === 'film' || reference.itemType === 'videoRecording' || reference.itemType === 'tvBroadcast') return 'film';
+  if (reference.itemType === 'webpage' || reference.itemType === 'blogPost') return 'web';
+  if (reference.itemType === 'journalArticle' || reference.itemType === 'newspaperArticle') return 'article';
+  if (reference.itemType === 'thesis') return 'thesis';
+  return 'document';
+}
+
+function objectDimensions(reference) {
+  const type = supportType(reference);
+  const shared = reference.memoirKeys?.length > 1;
+  if (type === 'film') return { width: shared ? 390 : 360, height: 260 };
+  if (type === 'web') return { width: shared ? 370 : 340, height: 270 };
+  if (type === 'article') return { width: shared ? 300 : 275, height: 330 };
+  if (type === 'chapter') return { width: 240, height: 330 };
+  if (type === 'thesis') return { width: 260, height: 350 };
+  if (type === 'book') return { width: shared ? 260 : 230, height: shared ? 365 : 335 };
+  return { width: 270, height: 320 };
+}
+
+function packReferences(references, viewport) {
+  const margin = viewport.width < 760 ? 86 : 118;
+  const gapX = viewport.width < 760 ? 34 : 58;
+  const gapY = viewport.width < 760 ? 42 : 56;
+  const maxWidth = clamp(viewport.width * (viewport.width < 760 ? 2.2 : 1.75), 980, 2320);
+  let x = margin;
+  let y = margin + 82;
+  let rowHeight = 0;
+  const items = references.map((reference, index) => {
+    const size = objectDimensions(reference);
+    if (x + size.width > maxWidth - margin && x > margin) {
+      x = margin;
+      y += rowHeight + gapY;
+      rowHeight = 0;
+    }
+    const layout = {
+      index: index + 1,
+      x,
+      y,
+      width: size.width,
+      height: size.height,
+      rotation: 0,
+      layer: reference.memoirKeys?.length > 1 ? 3 : 1,
+    };
+    x += size.width + gapX;
+    rowHeight = Math.max(rowHeight, size.height);
+    return { reference, layout };
+  });
+  return {
+    items,
+    layout: {
+      width: Math.max(maxWidth, x + margin),
+      height: Math.max(viewport.height + 240, y + rowHeight + margin + 150),
+    },
+  };
+}
+
+function centerOf(item) {
+  const layout = item.layout;
+  return {
+    x: layout.x + layout.width / 2,
+    y: layout.y + layout.height / 2,
+  };
+}
+
+function sharesMemoir(left, right) {
+  return (left.memoirKeys || []).some((key) => (right.memoirKeys || []).includes(key));
+}
+
+function buildRelationLines(activeReference, references) {
+  if (!activeReference) return [];
+  const activeItem = references.find((item) => item.reference.key === activeReference.key);
+  if (!activeItem) return [];
+  const from = centerOf(activeItem);
+  return references
+    .filter(({ reference }) => reference.key !== activeReference.key && sharesMemoir(activeReference, reference))
+    .map((item) => ({
+      key: `${activeReference.key}-${item.reference.key}`,
+      from,
+      to: centerOf(item),
+      shared: activeReference.memoirKeys.filter((key) => item.reference.memoirKeys.includes(key)).length,
+    }));
+}
+
+function sourceHref(reference) {
+  return reference.url || reference.doiUrl || reference.zoteroUrl;
+}
+
+function assetLabel(reference) {
+  if (reference.embed && reference.asset?.kind === 'oembed') return 'Média intégré';
+  return ASSET_LABELS[reference.asset?.kind] || 'Image';
 }
 
 function FeatureToggle({ active, icon: Icon, label, onClick }) {
   return (
-    <button className={`chip${active ? ' is-active' : ''}`} type="button" onClick={onClick}>
+    <button className={`tool-chip${active ? ' is-active' : ''}`} type="button" onClick={onClick} aria-pressed={active}>
       <Icon size={15} aria-hidden="true" />
       <span>{label}</span>
     </button>
   );
 }
 
-function ReferenceCard({ reference, onSelect }) {
-  const sourceHref = reference.url || reference.doiUrl || reference.zoteroUrl;
-  return (
-    <article className="reference-card">
-      <button className="reference-open" type="button" onClick={() => onSelect(reference)}>
-        <span className={`reference-visual reference-visual--${reference.asset?.kind || 'fallback'}`}>
-          {reference.asset?.src && (
-            <img src={assetUrl(reference.asset.src)} alt="" loading="lazy" />
-          )}
-        </span>
-        <span className="reference-body">
-          <span className="reference-kicker">
-            <span>{reference.typeLabel}</span>
-            {reference.year && <span>{reference.year}</span>}
-          </span>
-          <strong>{reference.title}</strong>
-          <span className="reference-creator">{reference.creatorsLabel}</span>
-          <span className="reference-badges">
-            {reference.memoirKeys?.length > 1 && <span><UsersRound size={13} />{reference.memoirKeys.length}</span>}
-            {reference.attachments?.hasPdf && <span><FileText size={13} />PDF</span>}
-            {(reference.annotations?.count > 0 || reference.notes?.length > 0) && <span><Highlighter size={13} />{reference.annotations.count}</span>}
-            {reference.url && <span><Globe2 size={13} />web</span>}
-          </span>
-        </span>
-      </button>
-      {sourceHref && (
-        <a className="reference-link" href={sourceHref} target="_blank" rel="noreferrer" aria-label={`Ouvrir ${reference.title}`}>
-          <ArrowUpRight size={16} />
-        </a>
-      )}
-    </article>
-  );
-}
-
-function SharedStrip({ sharedReferences, onSelectKey }) {
-  if (!sharedReferences.length) return null;
-  return (
-    <section className="shared-strip" aria-labelledby="shared-heading">
-      <div className="section-heading">
-        <Sparkles size={18} aria-hidden="true" />
-        <h2 id="shared-heading">Références croisées</h2>
-      </div>
-      <div className="shared-list">
-        {sharedReferences.slice(0, 8).map((reference) => (
-          <button key={reference.key} className="shared-item" type="button" onClick={() => onSelectKey(reference.key)}>
-            <strong>{reference.title}</strong>
-            <span>{reference.creatorsLabel}{reference.year ? `, ${reference.year}` : ''}</span>
-            <em>{reference.count} mémoires</em>
-          </button>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function DetailDrawer({ reference, onClose }) {
+function ToolPanel({
+  open,
+  memoirs,
+  activeMemoir,
+  setActiveMemoir,
+  query,
+  setQuery,
+  typeFilter,
+  setTypeFilter,
+  yearFilter,
+  setYearFilter,
+  featureFilters,
+  setFeatureFilters,
+  allTypeOptions,
+  allYearOptions,
+  onClose,
+  onReset,
+}) {
   useEffect(() => {
+    if (!open) return undefined;
     const handleKey = (event) => {
       if (event.key === 'Escape') onClose();
     };
     window.addEventListener('keydown', handleKey);
     return () => window.removeEventListener('keydown', handleKey);
-  }, [onClose]);
+  }, [onClose, open]);
+
+  return (
+    <>
+      <div className={`panel-scrim${open ? ' is-open' : ''}`} role="presentation" onMouseDown={onClose} />
+      <aside className={`tool-panel${open ? ' is-open' : ''}`} role="dialog" aria-modal="true" aria-label="Filtres">
+        <div className="panel-head">
+          <h2>Filtres</h2>
+          <button className="icon-button" type="button" onClick={onClose} aria-label="Fermer">
+            <X size={20} />
+          </button>
+        </div>
+
+        <label className="tool-field tool-field--search">
+          <span><Search size={16} aria-hidden="true" />Recherche</span>
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Titre, auteur, sujet..." />
+        </label>
+
+        <label className="tool-field">
+          <span>Mémoire</span>
+          <select value={activeMemoir} onChange={(event) => setActiveMemoir(event.target.value)}>
+            <option value="">Tous</option>
+            {memoirs.map((memoir) => <option key={memoir.key} value={memoir.key}>{memoir.name}</option>)}
+          </select>
+        </label>
+
+        <label className="tool-field">
+          <span>Type</span>
+          <select value={typeFilter} onChange={(event) => setTypeFilter(event.target.value)}>
+            <option value="">Tous</option>
+            {allTypeOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+          </select>
+        </label>
+
+        <label className="tool-field">
+          <span>Année</span>
+          <select value={yearFilter} onChange={(event) => setYearFilter(event.target.value)}>
+            <option value="">Toutes</option>
+            {allYearOptions.map((year) => <option key={year} value={year}>{year}</option>)}
+          </select>
+        </label>
+
+        <div className="tool-cluster" aria-label="Filtres">
+          <FeatureToggle active={featureFilters.has('pdf')} icon={FileText} label="PDF" onClick={() => setFeatureFilters(toggleSet(featureFilters, 'pdf'))} />
+          <FeatureToggle active={featureFilters.has('url')} icon={Link2} label="Lien" onClick={() => setFeatureFilters(toggleSet(featureFilters, 'url'))} />
+          <FeatureToggle active={featureFilters.has('annotations')} icon={Highlighter} label="Surlignes" onClick={() => setFeatureFilters(toggleSet(featureFilters, 'annotations'))} />
+          <FeatureToggle active={featureFilters.has('shared')} icon={UsersRound} label="Croisées" onClick={() => setFeatureFilters(toggleSet(featureFilters, 'shared'))} />
+        </div>
+
+        <button className="reset-button" type="button" onClick={onReset}>
+          <RotateCcw size={16} aria-hidden="true" />
+          <span>Réinitialiser</span>
+        </button>
+      </aside>
+    </>
+  );
+}
+
+function AtlasObject({ reference, layout, active, related, onSelect, onHover }) {
+  const assetKind = reference.asset?.kind || 'fallback';
+  const type = supportType(reference);
+  const transform = `translate(${layout.x}px, ${layout.y}px)`;
+
+  return (
+    <article
+      className={`atlas-object atlas-object--${assetKind} atlas-object--${type}${active ? ' is-active' : ''}${related ? ' is-related' : ''}`}
+      style={{ width: layout.width, height: layout.height, transform, zIndex: active ? 10 : layout.layer || 1 }}
+      onMouseEnter={() => onHover(reference.key)}
+      onMouseLeave={() => onHover('')}
+    >
+      <button className="atlas-object-main" type="button" onClick={() => onSelect(reference)}>
+        <span className="object-number">{layout.index}</span>
+        <span className="object-media">
+          {reference.asset?.src && <img src={assetUrl(reference.asset.src)} alt="" loading="lazy" />}
+        </span>
+      </button>
+      <div className="object-caption">
+        <p>{reference.title}</p>
+        <span>{reference.typeLabel}{reference.year ? ` / ${reference.year}` : ''}</span>
+      </div>
+    </article>
+  );
+}
+
+function RelationLayer({ lines, width, height }) {
+  return (
+    <svg className="relation-layer" width={width} height={height} viewBox={`0 0 ${width} ${height}`} aria-hidden="true">
+      {lines.map((line) => (
+        <line
+          key={line.key}
+          x1={line.from.x}
+          y1={line.from.y}
+          x2={line.to.x}
+          y2={line.to.y}
+          strokeWidth={line.shared > 1 ? 2.4 : 1.5}
+        />
+      ))}
+    </svg>
+  );
+}
+
+function MiniMap({ items, layout, activeKey, transformState, viewport }) {
+  const width = 260;
+  const height = Math.round(width * (layout.height / layout.width));
+  const scale = width / layout.width;
+  const view = transformState?.scale
+    ? {
+      x: Math.max(0, (-transformState.positionX / transformState.scale) * scale),
+      y: Math.max(0, (-transformState.positionY / transformState.scale) * scale),
+      width: Math.min(width, (viewport.width / transformState.scale) * scale),
+      height: Math.min(height, (viewport.height / transformState.scale) * scale),
+    }
+    : null;
+
+  return (
+    <aside className="mini-map" aria-label="Plan de la table">
+      <div className="mini-map-board" style={{ width, height }}>
+        {items.map(({ reference, layout: item }) => (
+          <span
+            key={reference.key}
+            className={`mini-map-item${reference.key === activeKey ? ' is-active' : ''}`}
+            style={{
+              left: item.x * scale,
+              top: item.y * scale,
+              width: Math.max(5, item.width * scale),
+              height: Math.max(5, item.height * scale),
+            }}
+          >
+            {reference.asset?.src && <img src={assetUrl(reference.asset.src)} alt="" />}
+          </span>
+        ))}
+        {view && <span className="mini-map-viewport" style={{ left: view.x, top: view.y, width: view.width, height: view.height }} />}
+      </div>
+    </aside>
+  );
+}
+
+function DetailPanel({ reference, onClose }) {
+  const [embedLoaded, setEmbedLoaded] = useState(false);
+
+  useEffect(() => {
+    if (!reference) return undefined;
+    const handleKey = (event) => {
+      if (event.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+  }, [onClose, reference]);
+
+  useEffect(() => {
+    setEmbedLoaded(false);
+  }, [reference?.key]);
 
   if (!reference) return null;
-  const sourceHref = reference.url || reference.doiUrl || reference.zoteroUrl;
+  const href = sourceHref(reference);
+  const assetKind = reference.asset?.kind || 'fallback';
+  const canEmbed = Boolean(reference.embed?.src || reference.embed?.html);
+
   return (
-    <div className="drawer-backdrop" role="presentation" onMouseDown={onClose}>
-      <aside className="drawer" role="dialog" aria-modal="true" aria-label={reference.title} onMouseDown={(event) => event.stopPropagation()}>
-        <button className="drawer-close" type="button" onClick={onClose} aria-label="Fermer">
+    <aside className="detail-panel" role="dialog" aria-modal="false" aria-label={reference.title}>
+      <div className="panel-head">
+        <span>{reference.typeLabel}{reference.year ? ` / ${reference.year}` : ''}</span>
+        <button className="icon-button" type="button" onClick={onClose} aria-label="Fermer">
           <X size={20} />
         </button>
-        <div className="drawer-media">
-          {reference.asset?.src && <img src={assetUrl(reference.asset.src)} alt="" />}
-        </div>
-        <div className="drawer-content">
-          <div className="reference-kicker">
-            <span>{reference.typeLabel}</span>
-            {reference.year && <span>{reference.year}</span>}
-          </div>
-          <h2>{reference.title}</h2>
-          <p className="drawer-authors">{reference.creatorsLabel}</p>
-          <div className="drawer-actions">
-            {sourceHref && (
-              <a href={sourceHref} target="_blank" rel="noreferrer">
-                <ArrowUpRight size={16} />
-                <span>Source</span>
-              </a>
-            )}
-            {reference.zoteroUrl && (
-              <a href={reference.zoteroUrl} target="_blank" rel="noreferrer">
-                <Library size={16} />
-                <span>Zotero</span>
-              </a>
-            )}
-          </div>
+      </div>
 
-          {reference.abstract && <p className="abstract">{reference.abstract}</p>}
+      <div className={`detail-media detail-media--${assetKind}`}>
+        {embedLoaded && canEmbed ? (
+          <iframe
+            title={reference.embed.title || reference.title}
+            src={reference.embed.src || undefined}
+            srcDoc={reference.embed.src ? undefined : reference.embed.html}
+            sandbox="allow-scripts allow-same-origin allow-popups allow-presentation"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+            allowFullScreen
+          />
+        ) : (
+          reference.asset?.src && <img src={assetUrl(reference.asset.src)} alt="" />
+        )}
+      </div>
 
-          <dl className="meta-grid">
-            {reference.publisher && <><dt>Édition</dt><dd>{reference.publisher}</dd></>}
-            {reference.publicationTitle && <><dt>Revue</dt><dd>{reference.publicationTitle}</dd></>}
-            {reference.bookTitle && <><dt>Dans</dt><dd>{reference.bookTitle}</dd></>}
-            {reference.isbn && <><dt>ISBN</dt><dd>{reference.isbn}</dd></>}
-            {reference.doi && <><dt>DOI</dt><dd>{reference.doi}</dd></>}
-            {reference.citationKey && <><dt>Citekey</dt><dd>{reference.citationKey}</dd></>}
-          </dl>
+      <div className="detail-body">
+        <h2>{reference.title}</h2>
+        <p className="detail-authors">{reference.creatorsLabel}</p>
 
-          <div className="memoir-tags">
-            {(reference.memoirNames || []).map((name) => <span key={name}>{name}</span>)}
-          </div>
+        {canEmbed && !embedLoaded && (
+          <button className="media-load-button" type="button" onClick={() => setEmbedLoaded(true)}>
+            <Play size={16} aria-hidden="true" />
+            <span>Charger le média</span>
+          </button>
+        )}
 
-          {(reference.annotations?.count > 0 || reference.notes?.length > 0) && (
-            <section className="annotation-section">
-              <div className="section-heading">
-                <Highlighter size={18} aria-hidden="true" />
-                <h3>Notes et surlignes</h3>
-                <span>{reference.annotations?.count || 0}</span>
-              </div>
-              {(reference.annotations?.samples || []).map((sample, index) => (
-                <blockquote key={`${sample.page}-${index}`} style={{ borderColor: sample.color || '#d7dadd' }}>
-                  <p>{sample.text || sample.comment}</p>
-                  {sample.page && <cite>p. {sample.page}</cite>}
-                </blockquote>
-              ))}
-              {(reference.notes || []).map((note, index) => (
-                <blockquote key={`note-${index}`}>
-                  <p>{note.text}</p>
-                </blockquote>
-              ))}
-            </section>
+        {reference.abstract && <p className="detail-abstract">{reference.abstract}</p>}
+
+        {(reference.annotations?.count > 0 || reference.notes?.length > 0) && (
+          <section className="annotation-section">
+            <div className="annotation-head">
+              <Highlighter size={18} aria-hidden="true" />
+              <h3>Notes et surlignes</h3>
+              <span>{reference.annotations?.count || 0}</span>
+            </div>
+            {(reference.annotations?.samples || []).map((sample, index) => (
+              <blockquote key={`${sample.page}-${index}`} className="annotation-card" style={{ '--annotation-color': sample.color || '#f0d44d' }}>
+                <p>{sample.text || sample.comment}</p>
+                {sample.page && <cite>p. {sample.page}</cite>}
+              </blockquote>
+            ))}
+            {(reference.notes || []).map((note, index) => (
+              <blockquote key={`note-${index}`} className="annotation-card" style={{ '--annotation-color': '#f0d44d' }}>
+                <p>{note.text}</p>
+              </blockquote>
+            ))}
+          </section>
+        )}
+
+        <div className="detail-actions">
+          {href && (
+            <a href={href} target="_blank" rel="noreferrer">
+              <ArrowUpRight size={16} />
+              <span>Source</span>
+            </a>
+          )}
+          {reference.zoteroUrl && (
+            <a href={reference.zoteroUrl} target="_blank" rel="noreferrer">
+              <Library size={16} />
+              <span>Zotero</span>
+            </a>
+          )}
+          {reference.archive?.url && (
+            <a href={reference.archive.url} target="_blank" rel="noreferrer">
+              <Globe2 size={16} />
+              <span>Archive web</span>
+            </a>
           )}
         </div>
-      </aside>
-    </div>
+
+        <dl className="detail-meta">
+          <dt>Visuel</dt><dd>{assetLabel(reference)}</dd>
+          {reference.publisher && <><dt>Édition</dt><dd>{reference.publisher}</dd></>}
+          {reference.publicationTitle && <><dt>Revue</dt><dd>{reference.publicationTitle}</dd></>}
+          {reference.bookTitle && <><dt>Dans</dt><dd>{reference.bookTitle}</dd></>}
+          {reference.isbn && <><dt>ISBN</dt><dd>{reference.isbn}</dd></>}
+          {reference.doi && <><dt>DOI</dt><dd>{reference.doi}</dd></>}
+        </dl>
+
+        <div className="detail-rubrics">
+          {(reference.memoirNames || []).map((name) => <span key={name}>{name}</span>)}
+        </div>
+      </div>
+    </aside>
   );
 }
 
 function EmptyState() {
   return (
     <div className="empty-state">
-      <BookOpen size={28} aria-hidden="true" />
-      <p>Aucune référence dans cette sélection.</p>
+      <BookOpen size={30} aria-hidden="true" />
+      <p>Aucun objet dans cette sélection.</p>
     </div>
   );
 }
@@ -296,8 +514,11 @@ export default function App() {
   const [typeFilter, setTypeFilter] = useState('');
   const [yearFilter, setYearFilter] = useState('');
   const [featureFilters, setFeatureFilters] = useState(new Set());
-  const [sortMode, setSortMode] = useState('title');
+  const [toolsOpen, setToolsOpen] = useState(false);
   const [selectedReference, setSelectedReference] = useState(null);
+  const [hoveredKey, setHoveredKey] = useState('');
+  const [transformState, setTransformState] = useState({ scale: 1, positionX: 0, positionY: 0 });
+  const [viewport, setViewport] = useState({ width: 1280, height: 720 });
 
   useEffect(() => {
     let cancelled = false;
@@ -317,13 +538,19 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    const updateViewport = () => setViewport({ width: window.innerWidth, height: window.innerHeight });
+    updateViewport();
+    window.addEventListener('resize', updateViewport);
+    return () => window.removeEventListener('resize', updateViewport);
+  }, []);
+
   const references = catalog?.references || [];
   const memoirs = catalog?.memoirs || [];
-  const activeMemoirName = memoirs.find((memoir) => memoir.key === activeMemoir)?.name || 'Tous les mémoires';
 
   const filteredReferences = useMemo(() => {
     const search = normalize(query);
-    const base = references.filter((reference) => {
+    return references.filter((reference) => {
       if (activeMemoir && !reference.memoirKeys?.includes(activeMemoir)) return false;
       if (typeFilter && reference.itemType !== typeFilter) return false;
       if (yearFilter && reference.year !== yearFilter) return false;
@@ -333,22 +560,50 @@ export default function App() {
       }
       return true;
     });
-    return sortReferences(base, sortMode);
-  }, [activeMemoir, featureFilters, query, references, sortMode, typeFilter, yearFilter]);
+  }, [activeMemoir, featureFilters, query, references, typeFilter, yearFilter]);
 
+  const packed = useMemo(() => packReferences(filteredReferences, viewport), [filteredReferences, viewport]);
+  const visibleItems = packed.items;
+  const layout = packed.layout || catalog?.layout || DEFAULT_LAYOUT;
+  const fixedScale = useMemo(() => {
+    const chromeX = viewport.width < 760 ? 32 : 84;
+    const chromeY = viewport.width < 760 ? 120 : 150;
+    return clamp(
+      Math.min((viewport.width - chromeX) / layout.width, (viewport.height - chromeY) / layout.height) * 1.18,
+      viewport.width < 760 ? 0.46 : 0.5,
+      viewport.width < 760 ? 0.78 : 0.86,
+    );
+  }, [layout.height, layout.width, viewport.height, viewport.width]);
+
+  const activeReference = selectedReference || references.find((reference) => reference.key === hoveredKey) || null;
+  const relatedKeys = useMemo(() => new Set(activeReference
+    ? filteredReferences.filter((reference) => reference.key !== activeReference.key && sharesMemoir(activeReference, reference)).map((reference) => reference.key)
+    : []), [activeReference, filteredReferences]);
+  const relationLines = useMemo(() => buildRelationLines(activeReference, visibleItems), [activeReference, visibleItems]);
   const allTypeOptions = useMemo(() => typeOptions(references), [references]);
   const allYearOptions = useMemo(() => yearOptions(references), [references]);
+  const toolCount = activeToolCount({ activeMemoir, query, typeFilter, yearFilter, featureFilters });
 
-  function openReferenceByKey(key) {
-    const reference = references.find((candidate) => candidate.key === key);
-    if (reference) setSelectedReference(reference);
+  useEffect(() => {
+    setTransformState((current) => ({
+      ...current,
+      scale: fixedScale,
+    }));
+  }, [fixedScale]);
+
+  function resetTools() {
+    setActiveMemoir('');
+    setQuery('');
+    setTypeFilter('');
+    setYearFilter('');
+    setFeatureFilters(new Set());
   }
 
   if (error) {
     return (
-      <main className="app-shell">
+      <main className="app-shell app-shell--empty">
         <div className="empty-state">
-          <Library size={28} aria-hidden="true" />
+          <Library size={30} aria-hidden="true" />
           <p>{error}</p>
         </div>
       </main>
@@ -357,10 +612,10 @@ export default function App() {
 
   if (!catalog) {
     return (
-      <main className="app-shell">
+      <main className="app-shell app-shell--empty">
         <div className="empty-state">
-          <Library size={28} aria-hidden="true" />
-          <p>Chargement du catalogue…</p>
+          <Library size={30} aria-hidden="true" />
+          <p>Chargement du catalogue...</p>
         </div>
       </main>
     );
@@ -368,99 +623,86 @@ export default function App() {
 
   return (
     <main className="app-shell">
-      <header className="topbar">
-        <div className="brand-block">
-          <div className="brand-mark" aria-hidden="true"><Library size={24} /></div>
-          <div>
-            <p>EnsadNancy</p>
-            <h1>{catalog.source.rootCollectionName}</h1>
-          </div>
+      <header className="atlas-header">
+        <a className="brand-link" href={catalog.source.groupUrl} target="_blank" rel="noreferrer">
+          <Library size={20} aria-hidden="true" />
+          <span>EnsadNancy</span>
+        </a>
+        <div className="atlas-title">
+          <h1>{catalog.source.rootCollectionName}</h1>
+          <p>{filteredReferences.length} objets / {catalog.stats.referenceCount} références / {catalog.stats.annotationCount} surlignes</p>
         </div>
-        <div className="stats-row" aria-label="Statistiques du catalogue">
-          <Stat icon={Layers3} label="mémoires" value={catalog.stats.memoirCount} />
-          <Stat icon={BookOpen} label="références" value={catalog.stats.referenceCount} />
-          <Stat icon={Highlighter} label="surlignes" value={catalog.stats.annotationCount} />
-        </div>
+        <button className="tools-toggle" type="button" onClick={() => setToolsOpen(true)}>
+          <SlidersHorizontal size={18} aria-hidden="true" />
+          <span>Filtres</span>
+          {toolCount > 0 && <em>{toolCount}</em>}
+        </button>
       </header>
 
-      <section className="memoir-band" aria-label="Mémoires">
-        <button className={`memoir-button memoir-button--all${activeMemoir ? '' : ' is-active'}`} type="button" onClick={() => setActiveMemoir('')}>
-          <span className="memoir-name">Tous les mémoires</span>
-          <span className="memoir-meta">
-            <span>{catalog.stats.referenceCount} refs</span>
-            <span>{catalog.stats.sharedReferenceCount} croisées</span>
-          </span>
-        </button>
-        {memoirs.map((memoir) => (
-          <MemoirButton
-            key={memoir.key}
-            memoir={memoir}
-            active={activeMemoir === memoir.key}
-            onClick={() => setActiveMemoir(memoir.key)}
-          />
-        ))}
-      </section>
+      {filteredReferences.length ? (
+        <TransformWrapper
+          key={`${Math.round(fixedScale * 100)}-${layout.width}-${layout.height}-${filteredReferences.map((reference) => reference.key).join('-')}`}
+          initialScale={fixedScale}
+          minScale={fixedScale}
+          maxScale={fixedScale}
+          centerOnInit
+          limitToBounds={false}
+          wheel={{ disabled: true }}
+          pinch={{ disabled: true }}
+          doubleClick={{ disabled: true }}
+          onTransformed={(_, state) => setTransformState(state)}
+        >
+          {() => (
+            <>
+              <MiniMap items={visibleItems} layout={layout} activeKey={activeReference?.key || ''} transformState={transformState} viewport={viewport} />
+              <TransformComponent wrapperClass="atlas-wrapper" contentClass="atlas-content">
+                <section className="atlas-surface" style={{ width: layout.width, height: layout.height }} aria-label="Table de références">
+                  <RelationLayer lines={relationLines} width={layout.width} height={layout.height} />
+                  {visibleItems.map(({ reference, layout: itemLayout }) => (
+                    <AtlasObject
+                      key={reference.key}
+                      reference={reference}
+                      layout={itemLayout}
+                      active={activeReference?.key === reference.key}
+                      related={relatedKeys.has(reference.key)}
+                      onSelect={setSelectedReference}
+                      onHover={setHoveredKey}
+                    />
+                  ))}
+                </section>
+              </TransformComponent>
+            </>
+          )}
+        </TransformWrapper>
+      ) : (
+        <EmptyState />
+      )}
 
-      <SharedStrip sharedReferences={catalog.sharedReferences || []} onSelectKey={openReferenceByKey} />
+      <ToolPanel
+        open={toolsOpen}
+        memoirs={memoirs}
+        activeMemoir={activeMemoir}
+        setActiveMemoir={setActiveMemoir}
+        query={query}
+        setQuery={setQuery}
+        typeFilter={typeFilter}
+        setTypeFilter={setTypeFilter}
+        yearFilter={yearFilter}
+        setYearFilter={setYearFilter}
+        featureFilters={featureFilters}
+        setFeatureFilters={setFeatureFilters}
+        allTypeOptions={allTypeOptions}
+        allYearOptions={allYearOptions}
+        onClose={() => setToolsOpen(false)}
+        onReset={resetTools}
+      />
 
-      <section className="catalog-section">
-        <div className="catalog-heading">
-          <div>
-            <p>{activeMemoirName}</p>
-            <h2>{filteredReferences.length} références</h2>
-          </div>
-          <span className="updated"><CalendarDays size={15} />{formatUpdated(catalog.generatedAt)}</span>
-        </div>
+      <DetailPanel reference={selectedReference} onClose={() => setSelectedReference(null)} />
 
-        <div className="toolbar">
-          <label className="search-box">
-            <Search size={18} aria-hidden="true" />
-            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Rechercher" />
-          </label>
-          <label className="select-box">
-            <Filter size={16} aria-hidden="true" />
-            <select value={typeFilter} onChange={(event) => setTypeFilter(event.target.value)}>
-              <option value="">Types</option>
-              {allTypeOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-            </select>
-          </label>
-          <label className="select-box">
-            <CalendarDays size={16} aria-hidden="true" />
-            <select value={yearFilter} onChange={(event) => setYearFilter(event.target.value)}>
-              <option value="">Années</option>
-              {allYearOptions.map((year) => <option key={year} value={year}>{year}</option>)}
-            </select>
-          </label>
-          <label className="select-box">
-            <Layers3 size={16} aria-hidden="true" />
-            <select value={sortMode} onChange={(event) => setSortMode(event.target.value)}>
-              <option value="title">Titre</option>
-              <option value="year-desc">Année</option>
-              <option value="shared">Croisements</option>
-              <option value="type">Type</option>
-            </select>
-          </label>
-        </div>
-
-        <div className="chips-row" aria-label="Filtres rapides">
-          <FeatureToggle active={featureFilters.has('pdf')} icon={FileText} label="PDF" onClick={() => setFeatureFilters(toggleSet(featureFilters, 'pdf'))} />
-          <FeatureToggle active={featureFilters.has('url')} icon={Link2} label="Lien" onClick={() => setFeatureFilters(toggleSet(featureFilters, 'url'))} />
-          <FeatureToggle active={featureFilters.has('annotations')} icon={Highlighter} label="Surlignes" onClick={() => setFeatureFilters(toggleSet(featureFilters, 'annotations'))} />
-          <FeatureToggle active={featureFilters.has('shared')} icon={UsersRound} label="Croisées" onClick={() => setFeatureFilters(toggleSet(featureFilters, 'shared'))} />
-        </div>
-
-        {filteredReferences.length ? (
-          <div className="reference-grid">
-            {filteredReferences.map((reference) => (
-              <ReferenceCard key={reference.key} reference={reference} onSelect={setSelectedReference} />
-            ))}
-          </div>
-        ) : (
-          <EmptyState />
-        )}
-      </section>
-
-      <DetailDrawer reference={selectedReference} onClose={() => setSelectedReference(null)} />
+      <footer className="atlas-footer">
+        <span><CalendarDays size={14} aria-hidden="true" />{formatUpdated(catalog.generatedAt)}</span>
+        <span>Images et médias chargés à la demande</span>
+      </footer>
     </main>
   );
 }

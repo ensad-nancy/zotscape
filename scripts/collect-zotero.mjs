@@ -8,6 +8,7 @@ const publicRoot = path.join(projectRoot, 'public');
 const dataDir = path.join(publicRoot, 'data');
 const mediaDir = path.join(publicRoot, 'media');
 const coverDir = path.join(mediaDir, 'covers');
+const previewDir = path.join(mediaDir, 'previews');
 const screenshotDir = path.join(mediaDir, 'screenshots');
 const fallbackDir = path.join(mediaDir, 'fallbacks');
 const cacheDir = path.join(projectRoot, '.cache');
@@ -19,8 +20,17 @@ const API_BASE = 'https://api.zotero.org';
 const PAGE_SIZE = 100;
 const SCREENSHOT_LIMIT = Math.max(0, Number(process.env.ZOTSCAPE_SCREENSHOT_LIMIT || 18));
 const SKIP_SCREENSHOTS = process.env.ZOTSCAPE_SKIP_SCREENSHOTS === '1';
+const GOOGLE_BOOKS_API_KEY = process.env.GOOGLE_BOOKS_API_KEY || '';
+const ISBNDB_API_KEY = process.env.ISBNDB_API_KEY || '';
+const ATLAS_WIDTH = 3200;
+const ATLAS_HEIGHT = 2200;
 
 const EXCLUDED_ITEM_TYPES = new Set(['attachment', 'note', 'annotation']);
+const EXCLUDED_MEMOIR_COLLECTION_PATTERNS = [
+  /^acquisitions?\b/i,
+  /^acclimatements?\b/i,
+  /^m[ée]thodologie\b/i,
+];
 const WEB_CAPTURE_TYPES = new Set([
   'webpage',
   'blogPost',
@@ -58,6 +68,38 @@ const FALLBACK_PALETTES = [
   ['#c9ddff', '#111e33', '#3867b8'],
   ['#f0d8d8', '#2f1717', '#a74747'],
   ['#d6e8bd', '#182412', '#5a7e28'],
+];
+
+const OEMBED_ENDPOINTS = [
+  {
+    hosts: ['youtube.com', 'www.youtube.com', 'youtu.be', 'm.youtube.com'],
+    endpoint: 'https://www.youtube.com/oembed',
+  },
+  {
+    hosts: ['vimeo.com', 'www.vimeo.com'],
+    endpoint: 'https://vimeo.com/api/oembed.json',
+  },
+  {
+    hosts: ['soundcloud.com', 'www.soundcloud.com'],
+    endpoint: 'https://soundcloud.com/oembed',
+  },
+  {
+    hosts: ['flickr.com', 'www.flickr.com', 'flic.kr'],
+    endpoint: 'https://www.flickr.com/services/oembed/',
+  },
+];
+
+const BLOCKED_PATTERNS = [
+  /access denied/iu,
+  /anubis/iu,
+  /are you human/iu,
+  /checking if the site connection is secure/iu,
+  /cloudflare/iu,
+  /cf-browser-verification/iu,
+  /human or not/iu,
+  /protected by/iu,
+  /prove you are human/iu,
+  /unusual traffic/iu,
 ];
 
 function zoteroPrefix() {
@@ -162,6 +204,11 @@ async function zoteroAll(pathname, params = {}) {
 
 function normalizeSpace(value) {
   return String(value || '').replace(/\s+/gu, ' ').trim();
+}
+
+function isMemoirCollectionName(name) {
+  const normalized = normalizeSpace(name);
+  return normalized && !EXCLUDED_MEMOIR_COLLECTION_PATTERNS.some((pattern) => pattern.test(normalized));
 }
 
 function stripHtml(value) {
@@ -290,6 +337,81 @@ function publicUrl(value) {
   }
 }
 
+function absoluteUrl(value, base) {
+  try {
+    return publicUrl(new URL(String(value || '').trim(), base).toString());
+  } catch {
+    return '';
+  }
+}
+
+function decodeHtml(value) {
+  return String(value || '')
+    .replace(/&nbsp;/gu, ' ')
+    .replace(/&amp;/gu, '&')
+    .replace(/&quot;/gu, '"')
+    .replace(/&#39;/gu, "'")
+    .replace(/&apos;/gu, "'")
+    .replace(/&lt;/gu, '<')
+    .replace(/&gt;/gu, '>');
+}
+
+function getAttribute(tag, name) {
+  const pattern = new RegExp(`${name}\\s*=\\s*(['"])(.*?)\\1`, 'iu');
+  return decodeHtml(tag.match(pattern)?.[2] || '');
+}
+
+function metaContent(html, names) {
+  for (const name of names) {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+    const tag = html.match(new RegExp(`<meta\\b(?=[^>]*(?:property|name)=['"]${escaped}['"])[^>]*>`, 'iu'))?.[0];
+    if (tag) {
+      const value = getAttribute(tag, 'content');
+      if (value) return normalizeSpace(value);
+    }
+  }
+  return '';
+}
+
+function linkHref(html, typePattern) {
+  const links = html.match(/<link\b[^>]*>/giu) || [];
+  for (const tag of links) {
+    const type = getAttribute(tag, 'type');
+    if (typePattern.test(type)) {
+      const href = getAttribute(tag, 'href');
+      if (href) return href;
+    }
+  }
+  return '';
+}
+
+function extractIframeSrc(html, base) {
+  const iframe = String(html || '').match(/<iframe\b[^>]*>/iu)?.[0] || '';
+  const src = getAttribute(iframe, 'src');
+  return absoluteUrl(src, base);
+}
+
+function detectBlockedHtml(html, status = 200) {
+  if ([401, 403, 429, 503].includes(Number(status))) return true;
+  const text = stripHtml(String(html || '')).slice(0, 5000);
+  return BLOCKED_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function looksLikePublicPdfUrl(value) {
+  const url = publicUrl(value);
+  if (!url) return false;
+  try {
+    return new URL(url).pathname.toLowerCase().endsWith('.pdf');
+  } catch {
+    return false;
+  }
+}
+
+function assetPathExists(asset) {
+  if (!asset?.src) return false;
+  return exists(path.join(publicRoot, asset.src));
+}
+
 function getDoiUrl(doi) {
   const value = normalizeSpace(doi);
   if (!value) return '';
@@ -365,7 +487,33 @@ function extensionForContentType(contentType, fallback = '.jpg') {
   return fallback;
 }
 
-async function downloadImage(url, targetBasePath) {
+async function imageLooksUsable(filePath, role = 'preview') {
+  const stats = await fs.stat(filePath).catch(() => null);
+  if (!stats || stats.size < (role === 'cover' ? 1100 : 700)) return false;
+  const sharpModule = await import('sharp').catch(() => null);
+  const sharp = sharpModule?.default || sharpModule;
+  if (!sharp) return true;
+  try {
+    const image = sharp(filePath);
+    const metadata = await image.metadata();
+    if (!metadata.width || !metadata.height) return false;
+    if (role === 'cover') {
+      if (metadata.width < 80 || metadata.height < 110) return false;
+      const ratio = metadata.width / metadata.height;
+      if (ratio < 0.32 || ratio > 1.25) return false;
+    } else if (metadata.width < 120 || metadata.height < 80) {
+      return false;
+    }
+    const imageStats = await image.stats().catch(() => null);
+    const entropy = Number(imageStats?.entropy || 0);
+    if (entropy > 0 && entropy < 0.55) return false;
+    return true;
+  } catch {
+    return true;
+  }
+}
+
+async function downloadImage(url, targetBasePath, options = {}) {
   const response = await fetchWithRetry(url, { signal: AbortSignal.timeout(45_000) }, 2);
   if (!response.ok) return null;
   const contentType = response.headers.get('content-type') || '';
@@ -375,13 +523,17 @@ async function downloadImage(url, targetBasePath) {
   const extension = extensionForContentType(contentType);
   const filePath = `${targetBasePath}${extension}`;
   await fs.writeFile(filePath, bytes);
+  if (!await imageLooksUsable(filePath, options.role || 'preview')) {
+    await fs.unlink(filePath).catch(() => {});
+    return null;
+  }
   return filePath;
 }
 
 async function findOpenLibraryCover(reference) {
   for (const isbn of reference.isbns) {
     const url = `https://covers.openlibrary.org/b/isbn/${encodeURIComponent(isbn)}-L.jpg?default=false`;
-    const filePath = await downloadImage(url, path.join(coverDir, `${reference.key}-openlibrary-${isbn}`)).catch(() => null);
+    const filePath = await downloadImage(url, path.join(coverDir, `${reference.key}-openlibrary-${isbn}`), { role: 'cover' }).catch(() => null);
     if (filePath) {
       return {
         kind: 'cover',
@@ -400,13 +552,14 @@ async function findGoogleBooksCover(reference) {
     url.searchParams.set('q', `isbn:${isbn}`);
     url.searchParams.set('maxResults', '1');
     url.searchParams.set('projection', 'lite');
+    if (GOOGLE_BOOKS_API_KEY) url.searchParams.set('key', GOOGLE_BOOKS_API_KEY);
     const response = await fetchWithRetry(url, { signal: AbortSignal.timeout(30_000) }, 2).catch(() => null);
     if (!response?.ok) continue;
     const payload = await response.json().catch(() => null);
     const links = payload?.items?.[0]?.volumeInfo?.imageLinks || {};
     const imageUrl = publicUrl(links.extraLarge || links.large || links.medium || links.thumbnail || links.smallThumbnail);
     if (!imageUrl) continue;
-    const filePath = await downloadImage(imageUrl.replace(/^http:/u, 'https:'), path.join(coverDir, `${reference.key}-google-${isbn}`)).catch(() => null);
+    const filePath = await downloadImage(imageUrl.replace(/^http:/u, 'https:'), path.join(coverDir, `${reference.key}-google-${isbn}`), { role: 'cover' }).catch(() => null);
     if (filePath) {
       return {
         kind: 'cover',
@@ -419,17 +572,198 @@ async function findGoogleBooksCover(reference) {
   return null;
 }
 
+async function findIsbnDbCover(reference) {
+  if (!ISBNDB_API_KEY) return null;
+  for (const isbn of reference.isbns) {
+    const url = `https://api2.isbndb.com/book/${encodeURIComponent(isbn)}`;
+    const response = await fetchWithRetry(url, {
+      headers: { Authorization: ISBNDB_API_KEY },
+      signal: AbortSignal.timeout(30_000),
+    }, 2).catch(() => null);
+    if (!response?.ok) continue;
+    const payload = await response.json().catch(() => null);
+    const imageUrl = publicUrl(payload?.book?.image || payload?.book?.image_original || payload?.book?.cover);
+    if (!imageUrl) continue;
+    const filePath = await downloadImage(imageUrl.replace(/^http:/u, 'https:'), path.join(coverDir, `${reference.key}-isbndb-${isbn}`), { role: 'cover' }).catch(() => null);
+    if (filePath) {
+      return {
+        kind: 'cover',
+        src: mediaPath(filePath),
+        source: 'isbndb',
+        identifier: isbn,
+      };
+    }
+  }
+  return null;
+}
+
 async function enrichCover(reference, assetCache) {
   const cacheKey = `${reference.key}:${reference.version}:${reference.isbns.join(',')}`;
   const cached = assetCache.covers?.[reference.key];
   if (cached?.cacheKey && cached.cacheKey === cacheKey && cached.asset?.src) {
     const filePath = path.join(publicRoot, cached.asset.src);
-    if (await exists(filePath)) return cached.asset;
+    if (await exists(filePath) && await imageLooksUsable(filePath, 'cover')) return cached.asset;
   }
   if (!reference.isbns.length) return null;
-  const asset = await findOpenLibraryCover(reference) || await findGoogleBooksCover(reference);
+  const asset = await findOpenLibraryCover(reference)
+    || await findGoogleBooksCover(reference)
+    || await findIsbnDbCover(reference);
   assetCache.covers[reference.key] = { cacheKey, asset };
   return asset;
+}
+
+async function fetchHtml(url) {
+  const response = await fetchWithRetry(url, {
+    headers: {
+      Accept: 'text/html,application/xhtml+xml',
+    },
+    signal: AbortSignal.timeout(30_000),
+  }, 2).catch((error) => ({ ok: false, status: 0, error }));
+  if (!response?.ok) {
+    return {
+      html: '',
+      status: response?.status || 0,
+      blocked: detectBlockedHtml('', response?.status || 0),
+    };
+  }
+  const contentType = response.headers.get('content-type') || '';
+  if (!/html|xml/iu.test(contentType)) {
+    return { html: '', status: response.status, blocked: false };
+  }
+  const html = await response.text().catch(() => '');
+  return {
+    html,
+    status: response.status,
+    blocked: detectBlockedHtml(html, response.status),
+  };
+}
+
+function knownOembedEndpoint(url) {
+  try {
+    const host = new URL(url).hostname.toLowerCase().replace(/^www\./u, '');
+    const match = OEMBED_ENDPOINTS.find((provider) => provider.hosts.some((candidate) => (
+      host === candidate.replace(/^www\./u, '') || host.endsWith(`.${candidate.replace(/^www\./u, '')}`)
+    )));
+    return match?.endpoint || '';
+  } catch {
+    return '';
+  }
+}
+
+async function downloadPreviewImage(url, reference, type, assetCache, cacheKey) {
+  const cached = assetCache.previews?.[`${reference.key}:${type}`];
+  if (cached?.cacheKey === cacheKey && cached.asset?.src && await assetPathExists(cached.asset)) {
+    return cached.asset;
+  }
+  const imageUrl = publicUrl(String(url || '').replace(/^http:/u, 'https:'));
+  if (!imageUrl) return null;
+  const filePath = await downloadImage(imageUrl, path.join(previewDir, `${reference.key}-${type}`), { role: 'preview' }).catch(() => null);
+  const asset = filePath
+    ? {
+      kind: type,
+      src: mediaPath(filePath),
+      source: imageUrl,
+    }
+    : null;
+  assetCache.previews[`${reference.key}:${type}`] = { cacheKey, asset };
+  return asset;
+}
+
+async function fetchOembedPayload(reference, html = '') {
+  const url = publicUrl(reference.url);
+  if (!url) return null;
+  const endpoint = knownOembedEndpoint(url)
+    || absoluteUrl(linkHref(html, /application\/json\+oembed/iu), url)
+    || absoluteUrl(linkHref(html, /text\/xml\+oembed|application\/xml\+oembed/iu), url);
+  if (!endpoint) return null;
+  const requestUrl = new URL(endpoint);
+  if (!requestUrl.searchParams.has('url')) requestUrl.searchParams.set('url', url);
+  if (!requestUrl.searchParams.has('format') && !/\.json(?:$|\?)/iu.test(requestUrl.pathname)) {
+    requestUrl.searchParams.set('format', 'json');
+  }
+  const response = await fetchWithRetry(requestUrl, {
+    headers: { Accept: 'application/json' },
+    signal: AbortSignal.timeout(25_000),
+  }, 2).catch(() => null);
+  if (!response?.ok) return null;
+  return response.json().catch(() => null);
+}
+
+async function enrichOembed(reference, html, assetCache) {
+  const url = publicUrl(reference.url);
+  if (!url) return null;
+  const cacheKey = `${reference.key}:${reference.version}:${url}`;
+  const cached = assetCache.embeds?.[reference.key];
+  if (cached?.cacheKey === cacheKey && cached.embed) {
+    if (!cached.embed.thumbnail?.src || await assetPathExists(cached.embed.thumbnail)) return cached.embed;
+  }
+  const payload = await fetchOembedPayload(reference, html);
+  if (!payload) {
+    assetCache.embeds[reference.key] = { cacheKey, embed: null };
+    return null;
+  }
+  const thumbnail = await downloadPreviewImage(payload.thumbnail_url, reference, 'oembed', assetCache, `${cacheKey}:${payload.thumbnail_url || ''}`);
+  const embed = {
+    type: normalizeSpace(payload.type || ''),
+    provider: normalizeSpace(payload.provider_name || ''),
+    title: truncate(payload.title || reference.title, 180),
+    authorName: normalizeSpace(payload.author_name || ''),
+    html: payload.html || '',
+    src: extractIframeSrc(payload.html || '', url),
+    width: Number(payload.width || 0) || null,
+    height: Number(payload.height || 0) || null,
+    thumbnail,
+  };
+  assetCache.embeds[reference.key] = { cacheKey, embed };
+  return embed;
+}
+
+async function enrichOpenGraph(reference, html, assetCache) {
+  const url = publicUrl(reference.url);
+  if (!url || !html) return null;
+  const cacheKey = `${reference.key}:${reference.version}:${url}`;
+  const cached = assetCache.openGraph?.[reference.key];
+  if (cached?.cacheKey === cacheKey && cached.openGraph) {
+    if (!cached.openGraph.image?.src || await assetPathExists(cached.openGraph.image)) return cached.openGraph;
+  }
+  const imageUrl = absoluteUrl(metaContent(html, ['og:image', 'twitter:image', 'twitter:image:src']), url);
+  const image = await downloadPreviewImage(imageUrl, reference, 'open-graph', assetCache, `${cacheKey}:${imageUrl || ''}`);
+  const openGraph = {
+    title: truncate(metaContent(html, ['og:title', 'twitter:title']) || html.match(/<title[^>]*>([\s\S]*?)<\/title>/iu)?.[1] || '', 180),
+    description: truncate(metaContent(html, ['og:description', 'description', 'twitter:description']), 280),
+    siteName: normalizeSpace(metaContent(html, ['og:site_name'])),
+    url: absoluteUrl(metaContent(html, ['og:url']), url) || url,
+    image,
+  };
+  assetCache.openGraph[reference.key] = { cacheKey, openGraph };
+  return openGraph;
+}
+
+async function findWaybackArchive(reference, assetCache) {
+  const url = publicUrl(reference.url);
+  if (!url) return null;
+  const cacheKey = `${reference.key}:${reference.version}:${url}`;
+  const cached = assetCache.archives?.[reference.key];
+  if (cached?.cacheKey === cacheKey) return cached.archive || null;
+  const requestUrl = new URL('https://archive.org/wayback/available');
+  requestUrl.searchParams.set('url', url);
+  const response = await fetchWithRetry(requestUrl, { signal: AbortSignal.timeout(25_000) }, 2).catch(() => null);
+  if (!response?.ok) {
+    assetCache.archives[reference.key] = { cacheKey, archive: null };
+    return null;
+  }
+  const payload = await response.json().catch(() => null);
+  const closest = payload?.archived_snapshots?.closest;
+  const archiveUrl = publicUrl(closest?.url || '');
+  const archive = closest?.available && archiveUrl
+    ? {
+      url: archiveUrl,
+      timestamp: closest.timestamp || '',
+      status: closest.status || '',
+    }
+    : null;
+  assetCache.archives[reference.key] = { cacheKey, archive };
+  return archive;
 }
 
 async function exists(filePath) {
@@ -459,14 +793,19 @@ async function loadScreenshotTools() {
   }
 }
 
-async function captureScreenshot(reference, tools, assetCache) {
-  const url = publicUrl(reference.url);
+async function captureScreenshot(reference, tools, assetCache, options = {}) {
+  const url = publicUrl(options.url || reference.url);
   if (!tools || !url) return null;
-  const cacheKey = `${reference.key}:${reference.version}:${url}`;
-  const cached = assetCache.screenshots?.[reference.key];
-  if (cached?.cacheKey === cacheKey && cached.asset?.src) {
-    const filePath = path.join(publicRoot, cached.asset.src);
-    if (await exists(filePath)) return cached.asset;
+  const isPdf = looksLikePublicPdfUrl(url);
+  const kind = options.kind || (isPdf ? 'pdf-screenshot' : 'screenshot');
+  const cacheId = `${reference.key}:${kind}`;
+  const cacheKey = `${reference.key}:${reference.version}:${kind}:${url}`;
+  const cached = assetCache.screenshots?.[cacheId];
+  if (cached?.cacheKey === cacheKey) {
+    if (cached.asset?.src) {
+      const filePath = path.join(publicRoot, cached.asset.src);
+      if (await exists(filePath)) return cached.asset;
+    }
     if (cached.failed) return null;
   }
 
@@ -478,31 +817,42 @@ async function captureScreenshot(reference, tools, assetCache) {
   try {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 18_000 });
     await page.waitForTimeout(900);
+    const html = await page.content().catch(() => '');
+    if (detectBlockedHtml(html)) {
+      assetCache.screenshots[cacheId] = {
+        cacheKey,
+        asset: null,
+        failed: true,
+        blocked: true,
+        error: 'blocked page',
+      };
+      return null;
+    }
     const jpeg = await page.screenshot({
       type: 'jpeg',
       quality: 68,
       fullPage: false,
       animations: 'disabled',
     });
-    let filePath = path.join(screenshotDir, `${reference.key}.jpg`);
+    let filePath = path.join(screenshotDir, `${reference.key}-${kind}.jpg`);
     if (tools.sharp) {
-      filePath = path.join(screenshotDir, `${reference.key}.webp`);
+      filePath = path.join(screenshotDir, `${reference.key}-${kind}.webp`);
       await tools.sharp(jpeg)
-        .resize(900, 534, { fit: 'cover', position: 'top' })
+        .resize(900, 534, { fit: 'contain', background: '#f1f2ee' })
         .webp({ quality: 68 })
         .toFile(filePath);
     } else {
       await fs.writeFile(filePath, jpeg);
     }
     const asset = {
-      kind: 'screenshot',
+      kind,
       src: mediaPath(filePath),
       source: url,
     };
-    assetCache.screenshots[reference.key] = { cacheKey, asset };
+    assetCache.screenshots[cacheId] = { cacheKey, asset };
     return asset;
   } catch (error) {
-    assetCache.screenshots[reference.key] = {
+    assetCache.screenshots[cacheId] = {
       cacheKey,
       asset: null,
       failed: true,
@@ -585,6 +935,7 @@ function normalizeReference(item, context) {
     doi: normalizeSpace(data.DOI || ''),
     doiUrl: getDoiUrl(data.DOI || ''),
     url,
+    publicPdfUrl: looksLikePublicPdfUrl(url) ? url : '',
     citationKey: extractCitationKey(item),
     zoteroUrl: item.links?.alternate?.href || '',
     tags: (data.tags || []).map((tag) => normalizeSpace(tag.tag)).filter(Boolean),
@@ -597,9 +948,18 @@ function normalizeReference(item, context) {
     dateAdded: data.dateAdded || '',
     dateModified: data.dateModified || '',
     cover: null,
+    embed: null,
+    openGraph: null,
+    archive: null,
     screenshot: null,
     fallback: null,
     asset: null,
+    previewStatus: {
+      source: 'pending',
+      blocked: false,
+      reason: '',
+    },
+    layout: null,
   };
 }
 
@@ -623,16 +983,88 @@ function computeMemoirStats(memoir, references) {
 }
 
 function chooseCardAsset(reference) {
-  if (reference.screenshot && (WEB_CAPTURE_TYPES.has(reference.itemType) || !reference.cover)) {
-    return reference.screenshot;
+  return reference.cover
+    || reference.embed?.thumbnail
+    || reference.openGraph?.image
+    || reference.archive?.asset
+    || reference.screenshot
+    || reference.fallback;
+}
+
+function shouldCaptureVisual(reference) {
+  if (!reference.url) return false;
+  if (reference.cover || reference.embed?.thumbnail || reference.openGraph?.image || reference.archive?.asset) return false;
+  if (reference.publicPdfUrl) return !reference.cover;
+  return WEB_CAPTURE_TYPES.has(reference.itemType) || !reference.cover;
+}
+
+function objectSize(reference, index) {
+  const kind = reference.asset?.kind || 'fallback';
+  const shared = reference.memoirKeys.length > 1;
+  if (kind === 'cover') return { width: shared ? 250 : 220, height: shared ? 360 : 320 };
+  if (kind === 'fallback') return { width: shared ? 260 : 225, height: shared ? 360 : 320 };
+  if (kind === 'oembed' || kind === 'open-graph' || kind === 'archive' || kind === 'screenshot') {
+    const wide = index % 5 === 0 || shared;
+    return { width: wide ? 430 : 340, height: wide ? 290 : 230 };
   }
-  return reference.cover || reference.screenshot || reference.fallback;
+  return { width: 260, height: 320 };
+}
+
+function computeAtlasLayout(references, memoirs) {
+  const center = { x: ATLAS_WIDTH / 2, y: ATLAS_HEIGHT / 2 };
+  const memoirCenters = new Map();
+  const radiusX = 1040;
+  const radiusY = 650;
+  memoirs.forEach((memoir, index) => {
+    const angle = -Math.PI / 2 + (index / Math.max(1, memoirs.length)) * Math.PI * 2;
+    memoirCenters.set(memoir.key, {
+      x: center.x + Math.cos(angle) * radiusX,
+      y: center.y + Math.sin(angle) * radiusY,
+    });
+  });
+
+  const perMemoirIndex = new Map();
+  references.forEach((reference, index) => {
+    const primaryKey = reference.memoirKeys.length > 1 ? 'shared' : reference.memoirKeys[0];
+    const order = perMemoirIndex.get(primaryKey) || 0;
+    perMemoirIndex.set(primaryKey, order + 1);
+    const base = primaryKey === 'shared'
+      ? center
+      : (memoirCenters.get(primaryKey) || center);
+    const localAngle = hashIndex(`${reference.key}:angle`, 360) * (Math.PI / 180);
+    const ring = 110 + Math.floor(order / 4) * 145;
+    const drift = (order % 4) * 48;
+    const size = objectSize(reference, index);
+    const x = Math.round(Math.max(60, Math.min(ATLAS_WIDTH - size.width - 60, base.x + Math.cos(localAngle) * (ring + drift) - size.width / 2)));
+    const y = Math.round(Math.max(70, Math.min(ATLAS_HEIGHT - size.height - 70, base.y + Math.sin(localAngle) * (ring + drift) - size.height / 2)));
+    reference.layout = {
+      index: index + 1,
+      x,
+      y,
+      width: size.width,
+      height: size.height,
+      rotation: 0,
+      layer: reference.memoirKeys.length > 1 ? 3 : (reference.annotations.count > 0 ? 2 : 1),
+    };
+  });
+
+  return {
+    width: ATLAS_WIDTH,
+    height: ATLAS_HEIGHT,
+    memoirCenters: memoirs.map((memoir) => ({
+      key: memoir.key,
+      name: memoir.name,
+      x: Math.round(memoirCenters.get(memoir.key)?.x || center.x),
+      y: Math.round(memoirCenters.get(memoir.key)?.y || center.y),
+    })),
+  };
 }
 
 async function main() {
   await Promise.all([
     fs.mkdir(dataDir, { recursive: true }),
     fs.mkdir(coverDir, { recursive: true }),
+    fs.mkdir(previewDir, { recursive: true }),
     fs.mkdir(screenshotDir, { recursive: true }),
     fs.mkdir(fallbackDir, { recursive: true }),
     fs.mkdir(cacheDir, { recursive: true }),
@@ -640,10 +1072,18 @@ async function main() {
 
   const assetCache = {
     covers: {},
+    embeds: {},
+    openGraph: {},
+    previews: {},
+    archives: {},
     screenshots: {},
     ...(await readJson(assetCacheFile, {})),
   };
   assetCache.covers ||= {};
+  assetCache.embeds ||= {};
+  assetCache.openGraph ||= {};
+  assetCache.previews ||= {};
+  assetCache.archives ||= {};
   assetCache.screenshots ||= {};
 
   log(`Collecting Zotero group ${GROUP_ID}...`);
@@ -663,6 +1103,7 @@ async function main() {
 
   const memoirs = activeCollections
     .filter((collection) => (collection.data?.parentCollection || false) === rootCollection.key)
+    .filter((collection) => isMemoirCollectionName(collection.data?.name))
     .sort((left, right) => String(left.data?.name || '').localeCompare(String(right.data?.name || ''), 'fr'))
     .map((collection) => ({
       key: collection.key,
@@ -707,28 +1148,69 @@ async function main() {
     ));
 
   log(`Found ${memoirs.length} memoir collections and ${references.length} references.`);
-  log('Enriching covers and fallback cards...');
+  log('Enriching covers, embeds, page metadata and fallback cards...');
   for (const reference of references) {
     reference.cover = await enrichCover(reference, assetCache);
     reference.fallback = await generateFallbackAsset(reference);
   }
 
-  const screenshotCandidates = references
-    .filter((reference) => reference.url && (WEB_CAPTURE_TYPES.has(reference.itemType) || !reference.cover))
-    .slice(0, SCREENSHOT_LIMIT);
+  for (const reference of references) {
+    if (!reference.url) {
+      reference.previewStatus = { source: 'fallback', blocked: false, reason: 'no-url' };
+      continue;
+    }
+    const page = await fetchHtml(reference.url);
+    reference.previewStatus = {
+      source: 'pending',
+      blocked: page.blocked,
+      reason: page.blocked ? 'blocked-live-page' : '',
+    };
+    if (!page.blocked && page.html) {
+      reference.embed = await enrichOembed(reference, page.html, assetCache);
+      reference.openGraph = await enrichOpenGraph(reference, page.html, assetCache);
+    }
+    if (page.blocked || (!reference.cover && !reference.embed?.thumbnail && !reference.openGraph?.image)) {
+      reference.archive = await findWaybackArchive(reference, assetCache);
+    }
+  }
+
   const screenshotTools = await loadScreenshotTools();
-  if (screenshotTools && screenshotCandidates.length) {
-    log(`Capturing ${screenshotCandidates.length} targeted web thumbnails...`);
-    for (const reference of screenshotCandidates) {
-      reference.screenshot = await captureScreenshot(reference, screenshotTools, assetCache);
+  if (screenshotTools) {
+    let captured = 0;
+    const captureCandidates = references.filter((reference) => reference.url && !reference.cover && !reference.embed?.thumbnail && !reference.openGraph?.image);
+    log(`Capturing up to ${SCREENSHOT_LIMIT} final preview fallbacks...`);
+    for (const reference of captureCandidates) {
+      if (captured >= SCREENSHOT_LIMIT) break;
+      if (reference.archive?.url) {
+        const asset = await captureScreenshot(reference, screenshotTools, assetCache, {
+          url: reference.archive.url,
+          kind: 'archive',
+        });
+        if (asset) {
+          reference.archive.asset = asset;
+          captured += 1;
+          continue;
+        }
+      }
+      if (shouldCaptureVisual(reference)) {
+        reference.screenshot = await captureScreenshot(reference, screenshotTools, assetCache);
+        if (reference.screenshot) captured += 1;
+      }
     }
     await screenshotTools.browser.close().catch(() => {});
   }
 
   for (const reference of references) {
     reference.asset = chooseCardAsset(reference);
+    reference.previewStatus = {
+      ...(reference.previewStatus || {}),
+      source: reference.asset?.kind || 'none',
+      blocked: Boolean(reference.previewStatus?.blocked),
+      reason: reference.previewStatus?.reason || '',
+    };
   }
 
+  const atlasLayout = computeAtlasLayout(references, memoirs);
   const memoirsWithStats = memoirs.map((memoir) => computeMemoirStats(memoir, references));
   const sharedReferences = references
     .filter((reference) => reference.memoirKeys.length > 1)
@@ -765,6 +1247,7 @@ async function main() {
       noteCount: references.reduce((sum, reference) => sum + reference.notes.length, 0),
       attachmentCount: references.reduce((sum, reference) => sum + reference.attachments.count, 0),
     },
+    layout: atlasLayout,
     memoirs: memoirsWithStats,
     references,
     sharedReferences,
