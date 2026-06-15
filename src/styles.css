@@ -250,6 +250,15 @@ p {
   object-fit: contain;
 }
 
+.mini-map-fallback {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--fallback-ink) 14%, transparent) 0 12%, transparent 12%),
+    var(--fallback-paper);
+}
+
 .mini-map-item.is-active {
   opacity: 1;
   outline: 2px solid var(--blue);
@@ -279,18 +288,7 @@ p {
 .atlas-surface {
   position: relative;
   overflow: hidden;
-  background: #ecebe6;
-}
-
-.atlas-surface::before {
-  content: "";
-  position: absolute;
-  inset: 11% 8% auto auto;
-  width: 42%;
-  height: 26%;
-  background: rgba(167, 223, 112, 0.16);
-  border-radius: 6px;
-  pointer-events: none;
+  background: transparent;
 }
 
 .relation-layer {
@@ -313,8 +311,8 @@ p {
   top: 0;
   left: 0;
   display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
-  gap: 8px;
+  grid-template-rows: var(--media-height) var(--caption-height);
+  gap: 12px;
   transform-origin: center;
   transition: filter 160ms ease, opacity 160ms ease;
 }
@@ -331,7 +329,7 @@ p {
   position: relative;
   display: grid;
   width: 100%;
-  height: 100%;
+  height: var(--media-height);
   min-height: 0;
   padding: 0;
   background: transparent;
@@ -339,70 +337,94 @@ p {
   cursor: pointer;
 }
 
-.object-number {
-  position: absolute;
-  top: -10px;
-  left: -10px;
-  z-index: 4;
-  display: grid;
-  place-items: center;
-  min-width: 28px;
-  height: 28px;
-  padding: 0 6px;
-  color: var(--ink);
-  background: var(--highlight);
-  border: 0;
-  border-radius: 999px;
-  font-size: 12px;
-  font-weight: 950;
-}
-
 .object-media {
   position: relative;
   display: grid;
   place-items: center;
   width: 100%;
-  height: 100%;
+  height: var(--media-height);
   min-height: 0;
-  padding: 12px;
-  background: rgba(251, 251, 245, 0.56);
-  box-shadow: 0 16px 32px rgba(17, 18, 15, 0.12);
-  overflow: hidden;
-}
-
-.atlas-object--cover .object-media,
-.atlas-object--fallback .object-media {
+  padding: 0;
   background: transparent;
   box-shadow: none;
   overflow: visible;
+  isolation: isolate;
+}
+
+.atlas-object--book .object-media,
+.atlas-object--cover.atlas-object--book .object-media,
+.atlas-object--fallback.atlas-object--book .object-media {
+  border-radius: 3px 8px 8px 3px;
+  background:
+    linear-gradient(90deg, rgba(17, 18, 15, 0.16) 0 11px, rgba(255, 255, 255, 0.18) 11px 16px, transparent 16px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.35), rgba(242, 239, 229, 0.48));
+  box-shadow:
+    9px 12px 0 rgba(17, 18, 15, 0.08),
+    inset -11px 0 0 rgba(255, 255, 255, 0.36),
+    inset -16px 0 0 rgba(17, 18, 15, 0.04);
 }
 
 .atlas-object--book .object-media::before,
-.atlas-object--chapter .object-media::before,
 .atlas-object--thesis .object-media::before {
   content: "";
   position: absolute;
-  top: 8%;
-  bottom: 8%;
-  left: 9%;
-  width: 12px;
+  inset: 0 auto 0 12px;
+  width: 1px;
   z-index: 0;
-  background: rgba(17, 18, 15, 0.08);
-  border-radius: 2px;
+  background: rgba(17, 18, 15, 0.14);
+  pointer-events: none;
+}
+
+.atlas-object--chapter .object-media {
+  border-radius: 4px 10px 10px 4px;
+  background:
+    linear-gradient(90deg, rgba(17, 18, 15, 0.1) 0 7px, transparent 7px),
+    linear-gradient(110deg, rgba(255, 255, 255, 0.8), rgba(231, 231, 222, 0.58));
+  box-shadow:
+    7px 9px 0 rgba(17, 18, 15, 0.07),
+    inset -8px 0 0 rgba(255, 255, 255, 0.38);
+}
+
+.atlas-object--chapter .object-media::before {
+  content: "";
+  position: absolute;
+  inset: 12% 50% 12% auto;
+  width: 1px;
+  z-index: 0;
+  background: rgba(17, 18, 15, 0.1);
+  pointer-events: none;
 }
 
 .atlas-object--article .object-media::after,
 .atlas-object--document .object-media::after {
   content: "";
   position: absolute;
-  inset: 14px -8px -8px 18px;
+  inset: 15px 11px 11px 21px;
   z-index: 0;
-  background: rgba(255, 255, 255, 0.46);
+  background:
+    repeating-linear-gradient(0deg, rgba(17, 18, 15, 0.06) 0 1px, transparent 1px 18px),
+    rgba(255, 255, 255, 0.42);
   border-radius: 4px;
+  pointer-events: none;
+}
+
+.atlas-object--article .object-media,
+.atlas-object--document .object-media {
+  border-radius: 4px;
+  background:
+    linear-gradient(90deg, rgba(255, 123, 89, 0.16) 0 6px, transparent 6px),
+    #f7f7f1;
+  box-shadow:
+    8px 10px 0 rgba(17, 18, 15, 0.06),
+    inset 0 0 0 1px rgba(17, 18, 15, 0.05);
 }
 
 .atlas-object--web .object-media {
-  border-radius: 8px;
+  border-radius: 10px;
+  background: #fbfbf5;
+  box-shadow:
+    0 14px 24px rgba(17, 18, 15, 0.13),
+    inset 0 0 0 1px rgba(17, 18, 15, 0.06);
 }
 
 .atlas-object--web .object-media::before {
@@ -412,35 +434,310 @@ p {
   left: 10px;
   right: 10px;
   height: 18px;
-  z-index: 0;
-  background: rgba(17, 18, 15, 0.08);
+  z-index: 2;
+  background:
+    radial-gradient(circle at 10px 50%, rgba(255, 123, 89, 0.84) 0 3px, transparent 3.5px),
+    radial-gradient(circle at 22px 50%, rgba(241, 232, 77, 0.92) 0 3px, transparent 3.5px),
+    radial-gradient(circle at 34px 50%, rgba(167, 223, 112, 0.88) 0 3px, transparent 3.5px),
+    rgba(17, 18, 15, 0.08);
   border-radius: 999px;
+  pointer-events: none;
 }
 
 .atlas-object--film .object-media {
-  border-radius: 8px;
-  background: rgba(17, 18, 15, 0.08);
+  border-radius: 10px;
+  background: #151611;
+  box-shadow: 0 15px 24px rgba(17, 18, 15, 0.18);
 }
 
 .atlas-object--film .object-media::after {
+  content: none;
+}
+
+.atlas-object--film .object-media::before {
   content: "";
   position: absolute;
-  inset: 12px;
-  z-index: 0;
-  border-top: 8px dotted rgba(17, 18, 15, 0.16);
-  border-bottom: 8px dotted rgba(17, 18, 15, 0.16);
+  z-index: 3;
+  left: 50%;
+  top: 50%;
+  width: 0;
+  height: 0;
+  border-top: 15px solid transparent;
+  border-bottom: 15px solid transparent;
+  border-left: 22px solid rgba(251, 251, 245, 0.78);
+  transform: translate(-35%, -50%);
   pointer-events: none;
+}
+
+.atlas-object--thesis .object-media {
+  border-radius: 8px 8px 10px 10px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.42), transparent 26%),
+    #e7e4d8;
+  box-shadow:
+    9px 11px 0 rgba(17, 18, 15, 0.08),
+    inset 0 16px 0 rgba(17, 18, 15, 0.06);
+}
+
+.atlas-object--thesis .object-media::after {
+  content: "";
+  position: absolute;
+  left: 18px;
+  top: 0;
+  width: 38%;
+  height: 18px;
+  z-index: 0;
+  background: rgba(17, 18, 15, 0.06);
+  border-radius: 6px 6px 0 0;
+  pointer-events: none;
+}
+
+.atlas-object--fallback .object-media {
+  background: transparent;
+  box-shadow: none;
+}
+
+.atlas-object--fallback .object-media::before,
+.atlas-object--fallback .object-media::after {
+  content: none;
+}
+
+.dom-fallback {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: grid;
+  container-type: inline-size;
+  align-content: start;
+  gap: 14px;
+  min-width: 0;
+  min-height: 0;
+  padding: 28px;
+  color: var(--fallback-ink);
+  background: var(--fallback-paper);
+  box-shadow:
+    12px 14px 0 rgba(17, 18, 15, 0.08),
+    0 18px 28px rgba(17, 18, 15, 0.1);
+  overflow: hidden;
+}
+
+.dom-fallback::before,
+.dom-fallback::after {
+  content: "";
+  position: absolute;
+  pointer-events: none;
+}
+
+.dom-fallback-kicker,
+.dom-fallback em,
+.dom-fallback-authors {
+  position: relative;
+  z-index: 2;
+  font-family: var(--font-sans);
+  font-style: normal;
+}
+
+.dom-fallback-kicker {
+  width: fit-content;
+  padding-top: 10px;
+  color: var(--fallback-ink);
+  border-top: 7px solid var(--fallback-accent);
+  font-size: 11px;
+  font-weight: 950;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+.dom-fallback strong {
+  position: relative;
+  z-index: 2;
+  display: -webkit-box;
+  font-family: var(--font-sans);
+  font-size: clamp(22px, 10cqw, 38px);
+  font-weight: 950;
+  line-height: 0.98;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 5;
+}
+
+.dom-fallback-authors {
+  display: -webkit-box;
+  font-size: 13px;
+  font-weight: 850;
+  line-height: 1.1;
+  opacity: 0.74;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.dom-fallback em {
+  margin-top: auto;
+  font-size: 13px;
+  font-weight: 950;
+  opacity: 0.76;
+}
+
+.dom-fallback--book {
+  border-radius: 2px 8px 8px 2px;
+  padding-left: 38px;
+}
+
+.dom-fallback--book::before {
+  inset: 0 auto 0 0;
+  width: 24px;
+  background:
+    linear-gradient(90deg, rgba(17, 18, 15, 0.18), rgba(255, 255, 255, 0.18) 48%, transparent);
+}
+
+.dom-fallback--book::after {
+  top: 7px;
+  right: -13px;
+  bottom: 7px;
+  width: 18px;
+  background:
+    repeating-linear-gradient(0deg, rgba(17, 18, 15, 0.08) 0 1px, rgba(255, 255, 255, 0.6) 1px 3px);
+  transform: skewY(1deg);
+}
+
+.dom-fallback--chapter {
+  border-radius: 4px 10px 10px 4px;
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--fallback-ink) 11%, transparent) 0 7px, transparent 7px),
+    var(--fallback-paper);
+}
+
+.dom-fallback--chapter::after {
+  top: 9%;
+  bottom: 9%;
+  left: 50%;
+  width: 1px;
+  background: color-mix(in srgb, var(--fallback-ink) 14%, transparent);
+}
+
+.dom-fallback--article,
+.dom-fallback--document {
+  border-radius: 2px;
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--fallback-accent) 40%, transparent) 0 8px, transparent 8px),
+    #fbfbf5;
+}
+
+.dom-fallback--article::after,
+.dom-fallback--document::after {
+  left: 32px;
+  right: 22px;
+  bottom: 28px;
+  height: 84px;
+  background: repeating-linear-gradient(0deg, color-mix(in srgb, var(--fallback-ink) 10%, transparent) 0 2px, transparent 2px 17px);
+}
+
+.dom-fallback--film {
+  place-content: center start;
+  border-radius: 8px;
+  color: #fbfbf5;
+  background: color-mix(in srgb, var(--fallback-ink) 92%, #111 8%);
+}
+
+.dom-fallback--film::after {
+  top: 50%;
+  right: 30px;
+  width: 0;
+  height: 0;
+  border-top: 18px solid transparent;
+  border-bottom: 18px solid transparent;
+  border-left: 28px solid color-mix(in srgb, var(--fallback-accent) 84%, #fff 16%);
+  transform: translateY(-50%);
+}
+
+.dom-fallback--web {
+  padding-top: 56px;
+  border-radius: 12px;
+  background: #fbfbf5;
+}
+
+.dom-fallback--web::before {
+  top: 12px;
+  left: 14px;
+  right: 14px;
+  height: 22px;
+  background:
+    radial-gradient(circle at 11px 50%, var(--fallback-accent) 0 4px, transparent 4.5px),
+    radial-gradient(circle at 27px 50%, color-mix(in srgb, var(--fallback-ink) 18%, transparent) 0 4px, transparent 4.5px),
+    radial-gradient(circle at 43px 50%, color-mix(in srgb, var(--fallback-ink) 18%, transparent) 0 4px, transparent 4.5px),
+    color-mix(in srgb, var(--fallback-ink) 8%, transparent);
+  border-radius: 999px;
+}
+
+.dom-fallback--web::after {
+  left: 28px;
+  right: 28px;
+  bottom: 30px;
+  height: 62px;
+  background: repeating-linear-gradient(0deg, color-mix(in srgb, var(--fallback-ink) 10%, transparent) 0 2px, transparent 2px 18px);
+}
+
+.dom-fallback--thesis {
+  border-radius: 8px 8px 10px 10px;
+  padding-top: 48px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, #fff 46%, transparent), transparent 30%),
+    var(--fallback-paper);
+}
+
+.dom-fallback--thesis::before {
+  top: 0;
+  left: 22px;
+  width: 42%;
+  height: 24px;
+  background: color-mix(in srgb, var(--fallback-ink) 10%, transparent);
+  border-radius: 8px 8px 0 0;
 }
 
 .object-media img,
 .object-media iframe {
-  position: relative;
+  position: absolute;
+  inset: 14px;
   z-index: 1;
   display: block;
-  width: 100%;
-  height: 100%;
+  width: auto;
+  height: auto;
+  max-width: calc(100% - 28px);
+  max-height: calc(100% - 28px);
+  margin: auto;
+  padding: 0;
   border: 0;
   object-fit: contain;
+}
+
+.atlas-object--article .object-media img,
+.atlas-object--article .object-media iframe,
+.atlas-object--document .object-media img,
+.atlas-object--document .object-media iframe {
+  inset: 8px;
+  width: auto;
+  height: auto;
+  max-width: calc(100% - 16px);
+  max-height: calc(100% - 16px);
+}
+
+.atlas-object--web .object-media img,
+.atlas-object--web .object-media iframe {
+  inset: 34px 8px 8px;
+  width: auto;
+  height: auto;
+  max-width: calc(100% - 16px);
+  max-height: calc(100% - 42px);
+}
+
+.atlas-object--film .object-media img,
+.atlas-object--film .object-media iframe {
+  inset: 22px 14px;
+  width: auto;
+  height: auto;
+  max-width: calc(100% - 28px);
+  max-height: calc(100% - 44px);
 }
 
 .atlas-object--screenshot .object-media img,
@@ -448,21 +745,25 @@ p {
 .atlas-object--oembed .object-media img,
 .atlas-object--archive .object-media img,
 .atlas-object--pdf-screenshot .object-media img {
-  background: #fff;
+  background: transparent;
 }
 
 .atlas-object--cover .object-media img,
 .atlas-object--fallback .object-media img {
-  filter: drop-shadow(12px 15px 0 rgba(17, 18, 15, 0.14));
+  inset: 0;
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: 100%;
 }
 
-.atlas-object.is-active .object-media::after,
-.atlas-object.is-related .object-media::after {
+.atlas-object.is-active .atlas-object-main::after,
+.atlas-object.is-related .atlas-object-main::after {
   content: "";
   position: absolute;
   left: 8%;
   right: 8%;
-  bottom: 8%;
+  bottom: 11%;
   z-index: 2;
   height: 16px;
   background: rgba(241, 232, 77, 0.78);
@@ -472,17 +773,24 @@ p {
 
 .object-caption {
   display: grid;
+  height: var(--caption-height);
   max-width: 100%;
-  gap: 3px;
+  align-content: start;
+  gap: 4px;
   padding: 0 2px;
+  overflow: hidden;
 }
 
 .object-caption p {
+  display: -webkit-box;
   color: var(--ink);
   font-size: 15px;
   font-weight: 950;
   line-height: 1.05;
   overflow-wrap: anywhere;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
 }
 
 .object-caption span {
@@ -520,6 +828,42 @@ p {
   border-left: 0;
   box-shadow: var(--shadow);
   overflow: auto;
+}
+
+.detail-panel {
+  width: min(var(--detail-width, 460px), 100vw);
+}
+
+.detail-resizer {
+  position: fixed;
+  top: 0;
+  right: min(var(--detail-width, 460px), 100vw);
+  z-index: 24;
+  width: 14px;
+  height: 100vh;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  cursor: ew-resize;
+}
+
+.detail-resizer::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 5px;
+  width: 3px;
+  height: 58px;
+  background: rgba(17, 18, 15, 0.2);
+  border-radius: 999px;
+  transform: translateY(-50%);
+  opacity: 0;
+  transition: opacity 140ms ease;
+}
+
+.detail-resizer:hover::before,
+.detail-resizer:focus-visible::before {
+  opacity: 1;
 }
 
 .tool-panel {
@@ -628,7 +972,7 @@ p {
 .detail-media {
   display: grid;
   place-items: center;
-  min-height: 320px;
+  min-height: 300px;
   padding: 20px;
   background: #e5e5e1;
   border-bottom: 0;
@@ -647,10 +991,97 @@ p {
 }
 
 .detail-media iframe {
+  width: 100%;
   aspect-ratio: 16 / 9;
   height: auto;
-  min-height: 280px;
+  min-height: 230px;
   filter: none;
+}
+
+.detail-media .dom-fallback {
+  position: relative;
+  inset: auto;
+  width: min(320px, 100%);
+  height: min(64vh, 560px);
+  min-height: 390px;
+}
+
+.detail-media--chapter .dom-fallback,
+.detail-media--thesis .dom-fallback {
+  width: min(340px, 100%);
+}
+
+.detail-media--article .dom-fallback,
+.detail-media--document .dom-fallback {
+  width: min(390px, 100%);
+}
+
+.detail-media--film .dom-fallback,
+.detail-media--web .dom-fallback {
+  width: min(100%, 680px);
+  height: min(52vh, 390px);
+  min-height: 260px;
+}
+
+.embed-stage {
+  display: block;
+  width: min(100%, 760px);
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  background: #111;
+  box-shadow: 12px 14px 0 rgba(17, 18, 15, 0.08);
+}
+
+.embed-stage iframe {
+  display: block;
+  width: 100%;
+  max-width: none;
+  height: 100%;
+  max-height: none;
+  min-height: 0;
+  aspect-ratio: auto;
+  object-fit: contain;
+  filter: none;
+}
+
+.embed-stage--site {
+  width: 100%;
+  max-width: none;
+  height: min(58vh, 540px);
+  min-height: 320px;
+  background: #fff;
+  box-shadow:
+    0 18px 36px rgba(17, 18, 15, 0.12),
+    0 0 0 1px rgba(17, 18, 15, 0.06);
+}
+
+.embed-stage--site iframe {
+  width: 1120px;
+  height: 820px;
+  transform: scale(var(--site-scale, 0.38));
+  transform-origin: 0 0;
+}
+
+.detail-media--book,
+.detail-media--chapter,
+.detail-media--thesis {
+  min-height: 460px;
+}
+
+.detail-media--book img,
+.detail-media--chapter img,
+.detail-media--thesis img {
+  max-height: 640px;
+}
+
+.detail-media--film,
+.detail-media--web {
+  min-height: 260px;
+}
+
+.detail-media--film iframe,
+.detail-media--web iframe {
+  max-height: none;
 }
 
 .detail-media--screenshot img,
@@ -887,6 +1318,10 @@ p {
   .detail-panel {
     width: 100vw;
     border-left: 0;
+  }
+
+  .detail-resizer {
+    display: none;
   }
 
   .detail-body h2 {

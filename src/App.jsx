@@ -9,7 +9,6 @@ import {
   Highlighter,
   Library,
   Link2,
-  Play,
   RotateCcw,
   Search,
   SlidersHorizontal,
@@ -23,12 +22,22 @@ const DEFAULT_LAYOUT = { width: 1800, height: 1200 };
 const ASSET_LABELS = {
   archive: 'Archive web',
   cover: 'Couverture',
-  fallback: 'Carton de référence',
+  fallback: 'Objet composé',
   oembed: 'Média intégré',
   'open-graph': 'Image du site',
   'pdf-screenshot': 'PDF public',
   screenshot: 'Capture',
 };
+
+const FALLBACK_PALETTES = [
+  ['#f3d2c1', '#18212f', '#c4533d'],
+  ['#cde7df', '#162622', '#267c69'],
+  ['#e8d8fb', '#20162f', '#7447a8'],
+  ['#f5e6a7', '#282211', '#b3821d'],
+  ['#c9ddff', '#111e33', '#3867b8'],
+  ['#f0d8d8', '#2f1717', '#a74747'],
+  ['#d6e8bd', '#182412', '#5a7e28'],
+];
 
 function assetUrl(src = '') {
   if (!src) return '';
@@ -114,6 +123,33 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
+function hashValue(value = '') {
+  return Array.from(String(value)).reduce((hash, char) => (
+    ((hash << 5) - hash + char.charCodeAt(0)) >>> 0
+  ), 2166136261);
+}
+
+function parseTransformState(value, fallback) {
+  const text = String(value || '');
+  const translateScale = text.match(/translate\((-?\d+(?:\.\d+)?)px,\s*(-?\d+(?:\.\d+)?)px\)\s*scale\((-?\d+(?:\.\d+)?)\)/u);
+  if (translateScale) {
+    return {
+      positionX: Number(translateScale[1]),
+      positionY: Number(translateScale[2]),
+      scale: Number(translateScale[3]),
+    };
+  }
+  const matrix = text.match(/matrix\((-?\d+(?:\.\d+)?),\s*-?\d+(?:\.\d+)?,\s*-?\d+(?:\.\d+)?,\s*(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)\)/u);
+  if (matrix) {
+    return {
+      scale: Number(matrix[1]),
+      positionX: Number(matrix[3]),
+      positionY: Number(matrix[4]),
+    };
+  }
+  return fallback;
+}
+
 function supportType(reference) {
   if (reference.itemType === 'book') return 'book';
   if (reference.itemType === 'bookSection') return 'chapter';
@@ -127,48 +163,119 @@ function supportType(reference) {
 function objectDimensions(reference) {
   const type = supportType(reference);
   const shared = reference.memoirKeys?.length > 1;
-  if (type === 'film') return { width: shared ? 390 : 360, height: 260 };
-  if (type === 'web') return { width: shared ? 370 : 340, height: 270 };
-  if (type === 'article') return { width: shared ? 300 : 275, height: 330 };
-  if (type === 'chapter') return { width: 240, height: 330 };
-  if (type === 'thesis') return { width: 260, height: 350 };
-  if (type === 'book') return { width: shared ? 260 : 230, height: shared ? 365 : 335 };
-  return { width: 270, height: 320 };
+  const seed = hashValue(reference.key || reference.title);
+  const scale = (shared ? 1.04 : 1) * ([0.96, 1, 1.04][seed % 3]);
+  const captionHeight = 66;
+  const gap = 12;
+  const dimensions = {
+    article: { width: 286, mediaHeight: 332 },
+    book: { width: 226, mediaHeight: 324 },
+    chapter: { width: 214, mediaHeight: 286 },
+    document: { width: 276, mediaHeight: 318 },
+    film: { width: 392, mediaHeight: 224 },
+    thesis: { width: 248, mediaHeight: 332 },
+    web: { width: 356, mediaHeight: 238 },
+  }[type] || { width: 276, mediaHeight: 318 };
+  const width = Math.round(dimensions.width * scale);
+  const mediaHeight = Math.round(dimensions.mediaHeight * scale);
+  return {
+    width,
+    height: mediaHeight + gap + captionHeight,
+    mediaHeight,
+    captionHeight,
+  };
 }
 
 function packReferences(references, viewport) {
-  const margin = viewport.width < 760 ? 86 : 118;
-  const gapX = viewport.width < 760 ? 34 : 58;
-  const gapY = viewport.width < 760 ? 42 : 56;
-  const maxWidth = clamp(viewport.width * (viewport.width < 760 ? 2.2 : 1.75), 980, 2320);
-  let x = margin;
-  let y = margin + 82;
-  let rowHeight = 0;
+  const compact = viewport.width < 760;
+  const margin = compact ? 72 : 110;
+  const tableWidth = clamp(
+    viewport.width * (compact ? 2.55 : 1.42),
+    compact ? 1120 : 1840,
+    compact ? 1440 : 2240,
+  );
+  const panelHeight = compact ? 1580 : 1680;
+  const anchors = [
+    [0.08, 0.08], [0.23, 0.02], [0.39, 0.10], [0.58, 0.08], [0.78, 0.15],
+    [0.03, 0.26], [0.22, 0.27], [0.43, 0.30], [0.66, 0.28], [0.82, 0.35],
+    [0.12, 0.46], [0.33, 0.43], [0.53, 0.49], [0.74, 0.50],
+    [0.05, 0.66], [0.24, 0.63], [0.46, 0.70], [0.67, 0.65], [0.84, 0.74],
+    [0.18, 0.84], [0.40, 0.88], [0.61, 0.82], [0.79, 0.90],
+  ];
+  const placedLayouts = [];
+  const collides = (layout) => placedLayouts.some((placed) => (
+    layout.x < placed.x + placed.width + 34
+    && layout.x + layout.width + 34 > placed.x
+    && layout.y < placed.y + placed.height + 34
+    && layout.y + layout.height + 34 > placed.y
+  ));
   const items = references.map((reference, index) => {
     const size = objectDimensions(reference);
-    if (x + size.width > maxWidth - margin && x > margin) {
-      x = margin;
-      y += rowHeight + gapY;
-      rowHeight = 0;
-    }
+    const seed = hashValue(`${reference.key}:${index}`);
+    const anchor = anchors[index % anchors.length];
+    const panel = Math.floor(index / anchors.length);
+    const jitterX = Math.round((((seed % 100) / 100) - 0.5) * (compact ? 58 : 92));
+    const jitterY = Math.round(((((seed >> 8) % 100) / 100) - 0.5) * (compact ? 52 : 86));
     const layout = {
       index: index + 1,
-      x,
-      y,
+      x: clamp(
+        Math.round(margin + anchor[0] * (tableWidth - margin * 2 - size.width) + jitterX),
+        margin,
+        Math.max(margin, tableWidth - margin - size.width),
+      ),
+      y: Math.max(margin, Math.round(margin + panel * panelHeight + anchor[1] * panelHeight + jitterY)),
       width: size.width,
       height: size.height,
+      mediaHeight: size.mediaHeight,
+      captionHeight: size.captionHeight,
       rotation: 0,
       layer: reference.memoirKeys?.length > 1 ? 3 : 1,
     };
-    x += size.width + gapX;
-    rowHeight = Math.max(rowHeight, size.height);
+    let guard = 0;
+    const shifts = [
+      [0, 0], [54, 34], [-58, 42], [92, 82], [-98, 92], [18, 138],
+      [132, 142], [-138, 154], [0, 214], [74, 250], [-80, 268],
+    ];
+    while (collides(layout) && guard < 80) {
+      const shift = shifts[guard % shifts.length];
+      const pass = Math.floor(guard / shifts.length);
+      layout.x = clamp(
+        Math.round(margin + anchor[0] * (tableWidth - margin * 2 - size.width) + jitterX + shift[0]),
+        margin,
+        Math.max(margin, tableWidth - margin - size.width),
+      );
+      layout.y = Math.max(margin, Math.round(margin + panel * panelHeight + anchor[1] * panelHeight + jitterY + shift[1] + pass * 92));
+      guard += 1;
+    }
+    placedLayouts.push(layout);
     return { reference, layout };
   });
+  for (let pass = 0; pass < 6; pass += 1) {
+    let changed = false;
+    for (let index = 0; index < placedLayouts.length; index += 1) {
+      for (let nextIndex = index + 1; nextIndex < placedLayouts.length; nextIndex += 1) {
+        const current = placedLayouts[index];
+        const next = placedLayouts[nextIndex];
+        const overlaps = current.x < next.x + next.width + 34
+          && current.x + current.width + 34 > next.x
+          && current.y < next.y + next.height + 34
+          && current.y + current.height + 34 > next.y;
+        if (overlaps) {
+          const lower = current.y <= next.y ? next : current;
+          const upper = lower === next ? current : next;
+          lower.y = upper.y + upper.height + 46;
+          changed = true;
+        }
+      }
+    }
+    if (!changed) break;
+  }
+  const tableHeight = Math.max(...placedLayouts.map((layout) => layout.y + layout.height), viewport.height + 320) + margin;
   return {
     items,
     layout: {
-      width: Math.max(maxWidth, x + margin),
-      height: Math.max(viewport.height + 240, y + rowHeight + margin + 150),
+      width: tableWidth,
+      height: tableHeight,
     },
   };
 }
@@ -207,6 +314,43 @@ function sourceHref(reference) {
 function assetLabel(reference) {
   if (reference.embed && reference.asset?.kind === 'oembed') return 'Média intégré';
   return ASSET_LABELS[reference.asset?.kind] || 'Image';
+}
+
+function fallbackPalette(reference) {
+  const [paper, ink, accent] = FALLBACK_PALETTES[hashValue(reference.key || reference.title) % FALLBACK_PALETTES.length];
+  return {
+    '--fallback-paper': paper,
+    '--fallback-ink': ink,
+    '--fallback-accent': accent,
+  };
+}
+
+function ReferenceVisual({ reference, detail = false }) {
+  const assetKind = reference.asset?.kind || 'fallback';
+  const type = supportType(reference);
+  if (assetKind === 'fallback') {
+    return (
+      <span
+        className={`dom-fallback dom-fallback--${type}${detail ? ' dom-fallback--detail' : ''}`}
+        style={fallbackPalette(reference)}
+      >
+        <span className="dom-fallback-kicker">{reference.typeLabel}</span>
+        <strong>{reference.title}</strong>
+        {reference.creatorsLabel && <span className="dom-fallback-authors">{reference.creatorsLabel}</span>}
+        <em>{reference.year || 's. d.'}</em>
+      </span>
+    );
+  }
+  if (!reference.asset?.src) return null;
+  return <img src={assetUrl(reference.asset.src)} alt="" loading={detail ? 'eager' : 'lazy'} />;
+}
+
+function MiniMapVisual({ reference }) {
+  if (reference.asset?.kind === 'fallback') {
+    return <span className="mini-map-fallback" style={fallbackPalette(reference)} />;
+  }
+  if (!reference.asset?.src) return null;
+  return <img src={assetUrl(reference.asset.src)} alt="" />;
 }
 
 function FeatureToggle({ active, icon: Icon, label, onClick }) {
@@ -309,14 +453,20 @@ function AtlasObject({ reference, layout, active, related, onSelect, onHover }) 
   return (
     <article
       className={`atlas-object atlas-object--${assetKind} atlas-object--${type}${active ? ' is-active' : ''}${related ? ' is-related' : ''}`}
-      style={{ width: layout.width, height: layout.height, transform, zIndex: active ? 10 : layout.layer || 1 }}
+      style={{
+        width: layout.width,
+        height: layout.height,
+        '--media-height': `${layout.mediaHeight}px`,
+        '--caption-height': `${layout.captionHeight}px`,
+        transform,
+        zIndex: active ? 10 : layout.layer || 1,
+      }}
       onMouseEnter={() => onHover(reference.key)}
       onMouseLeave={() => onHover('')}
     >
       <button className="atlas-object-main" type="button" onClick={() => onSelect(reference)}>
-        <span className="object-number">{layout.index}</span>
         <span className="object-media">
-          {reference.asset?.src && <img src={assetUrl(reference.asset.src)} alt="" loading="lazy" />}
+          <ReferenceVisual reference={reference} />
         </span>
       </button>
       <div className="object-caption">
@@ -348,14 +498,20 @@ function MiniMap({ items, layout, activeKey, transformState, viewport }) {
   const width = 260;
   const height = Math.round(width * (layout.height / layout.width));
   const scale = width / layout.width;
-  const view = transformState?.scale
+  const rawView = transformState?.scale
     ? {
-      x: Math.max(0, (-transformState.positionX / transformState.scale) * scale),
-      y: Math.max(0, (-transformState.positionY / transformState.scale) * scale),
-      width: Math.min(width, (viewport.width / transformState.scale) * scale),
-      height: Math.min(height, (viewport.height / transformState.scale) * scale),
+      x: (-transformState.positionX / transformState.scale) * scale,
+      y: (-transformState.positionY / transformState.scale) * scale,
+      width: (viewport.width / transformState.scale) * scale,
+      height: (viewport.height / transformState.scale) * scale,
     }
     : null;
+  const view = rawView && {
+    x: clamp(rawView.x, 0, Math.max(0, width - Math.min(width, rawView.width))),
+    y: clamp(rawView.y, 0, Math.max(0, height - Math.min(height, rawView.height))),
+    width: Math.min(width, rawView.width),
+    height: Math.min(height, rawView.height),
+  };
 
   return (
     <aside className="mini-map" aria-label="Plan de la table">
@@ -371,7 +527,7 @@ function MiniMap({ items, layout, activeKey, transformState, viewport }) {
               height: Math.max(5, item.height * scale),
             }}
           >
-            {reference.asset?.src && <img src={assetUrl(reference.asset.src)} alt="" />}
+            <MiniMapVisual reference={reference} />
           </span>
         ))}
         {view && <span className="mini-map-viewport" style={{ left: view.x, top: view.y, width: view.width, height: view.height }} />}
@@ -380,9 +536,7 @@ function MiniMap({ items, layout, activeKey, transformState, viewport }) {
   );
 }
 
-function DetailPanel({ reference, onClose }) {
-  const [embedLoaded, setEmbedLoaded] = useState(false);
-
+function DetailPanel({ reference, onClose, width, onResize }) {
   useEffect(() => {
     if (!reference) return undefined;
     const handleKey = (event) => {
@@ -392,17 +546,35 @@ function DetailPanel({ reference, onClose }) {
     return () => window.removeEventListener('keydown', handleKey);
   }, [onClose, reference]);
 
-  useEffect(() => {
-    setEmbedLoaded(false);
-  }, [reference?.key]);
-
   if (!reference) return null;
   const href = sourceHref(reference);
   const assetKind = reference.asset?.kind || 'fallback';
-  const canEmbed = Boolean(reference.embed?.src || reference.embed?.html);
+  const type = supportType(reference);
+  const embedSrc = reference.embed?.src || (type === 'web' && href ? href : '');
+  const embedHtml = embedSrc ? '' : reference.embed?.html || '';
+  const canEmbed = Boolean(embedSrc || embedHtml);
+  const siteEmbed = canEmbed && type === 'web';
+  const siteScale = clamp((width - 40) / 1120, 0.28, 0.68);
+
+  const startResize = (event) => {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = width;
+    const handleMove = (moveEvent) => {
+      const maxWidth = Math.min(window.innerWidth - 24, 820);
+      onResize(clamp(startWidth + startX - moveEvent.clientX, 360, maxWidth));
+    };
+    const handleUp = () => {
+      window.removeEventListener('pointermove', handleMove);
+      window.removeEventListener('pointerup', handleUp);
+    };
+    window.addEventListener('pointermove', handleMove);
+    window.addEventListener('pointerup', handleUp);
+  };
 
   return (
-    <aside className="detail-panel" role="dialog" aria-modal="false" aria-label={reference.title}>
+    <aside className="detail-panel" role="dialog" aria-modal="false" aria-label={reference.title} style={{ '--detail-width': `${width}px` }}>
+      <button className="detail-resizer" type="button" aria-label="Redimensionner le volet" onPointerDown={startResize} />
       <div className="panel-head">
         <span>{reference.typeLabel}{reference.year ? ` / ${reference.year}` : ''}</span>
         <button className="icon-button" type="button" onClick={onClose} aria-label="Fermer">
@@ -410,31 +582,26 @@ function DetailPanel({ reference, onClose }) {
         </button>
       </div>
 
-      <div className={`detail-media detail-media--${assetKind}`}>
-        {embedLoaded && canEmbed ? (
-          <iframe
-            title={reference.embed.title || reference.title}
-            src={reference.embed.src || undefined}
-            srcDoc={reference.embed.src ? undefined : reference.embed.html}
-            sandbox="allow-scripts allow-same-origin allow-popups allow-presentation"
-            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-            allowFullScreen
-          />
+      <div className={`detail-media detail-media--${assetKind} detail-media--${type}${canEmbed ? ' detail-media--embed' : ''}`}>
+        {canEmbed ? (
+          <div className={`embed-stage${siteEmbed ? ' embed-stage--site' : ''}`} style={siteEmbed ? { '--site-scale': siteScale } : undefined}>
+            <iframe
+              title={reference.embed?.title || reference.title}
+              src={embedSrc || undefined}
+              srcDoc={embedSrc ? undefined : embedHtml}
+              sandbox="allow-scripts allow-same-origin allow-popups allow-presentation"
+              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+              allowFullScreen
+            />
+          </div>
         ) : (
-          reference.asset?.src && <img src={assetUrl(reference.asset.src)} alt="" />
+          <ReferenceVisual reference={reference} detail />
         )}
       </div>
 
       <div className="detail-body">
         <h2>{reference.title}</h2>
         <p className="detail-authors">{reference.creatorsLabel}</p>
-
-        {canEmbed && !embedLoaded && (
-          <button className="media-load-button" type="button" onClick={() => setEmbedLoaded(true)}>
-            <Play size={16} aria-hidden="true" />
-            <span>Charger le média</span>
-          </button>
-        )}
 
         {reference.abstract && <p className="detail-abstract">{reference.abstract}</p>}
 
@@ -516,6 +683,7 @@ export default function App() {
   const [featureFilters, setFeatureFilters] = useState(new Set());
   const [toolsOpen, setToolsOpen] = useState(false);
   const [selectedReference, setSelectedReference] = useState(null);
+  const [detailWidth, setDetailWidth] = useState(460);
   const [hoveredKey, setHoveredKey] = useState('');
   const [transformState, setTransformState] = useState({ scale: 1, positionX: 0, positionY: 0 });
   const [viewport, setViewport] = useState({ width: 1280, height: 720 });
@@ -567,13 +735,12 @@ export default function App() {
   const layout = packed.layout || catalog?.layout || DEFAULT_LAYOUT;
   const fixedScale = useMemo(() => {
     const chromeX = viewport.width < 760 ? 32 : 84;
-    const chromeY = viewport.width < 760 ? 120 : 150;
     return clamp(
-      Math.min((viewport.width - chromeX) / layout.width, (viewport.height - chromeY) / layout.height) * 1.18,
-      viewport.width < 760 ? 0.46 : 0.5,
-      viewport.width < 760 ? 0.78 : 0.86,
+      ((viewport.width - chromeX) / layout.width) * 1.08,
+      viewport.width < 760 ? 0.68 : 0.84,
+      viewport.width < 760 ? 0.9 : 1,
     );
-  }, [layout.height, layout.width, viewport.height, viewport.width]);
+  }, [layout.width, viewport.width]);
 
   const activeReference = selectedReference || references.find((reference) => reference.key === hoveredKey) || null;
   const relatedKeys = useMemo(() => new Set(activeReference
@@ -590,6 +757,38 @@ export default function App() {
       scale: fixedScale,
     }));
   }, [fixedScale]);
+
+  useEffect(() => {
+    let frame = 0;
+    let observer = null;
+    const syncTransform = () => {
+      const element = document.querySelector('.atlas-content');
+      if (!element) return;
+      const next = parseTransformState(element.style.transform || window.getComputedStyle(element).transform, transformState);
+      setTransformState((current) => (
+        current.scale === next.scale
+        && current.positionX === next.positionX
+        && current.positionY === next.positionY
+          ? current
+          : next
+      ));
+    };
+    const attach = () => {
+      const element = document.querySelector('.atlas-content');
+      if (!element) {
+        frame = window.requestAnimationFrame(attach);
+        return;
+      }
+      syncTransform();
+      observer = new MutationObserver(syncTransform);
+      observer.observe(element, { attributes: true, attributeFilter: ['style'] });
+    };
+    frame = window.requestAnimationFrame(attach);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      observer?.disconnect();
+    };
+  }, [fixedScale, layout.height, layout.width, visibleItems.length]);
 
   function resetTools() {
     setActiveMemoir('');
@@ -697,7 +896,7 @@ export default function App() {
         onReset={resetTools}
       />
 
-      <DetailPanel reference={selectedReference} onClose={() => setSelectedReference(null)} />
+      <DetailPanel reference={selectedReference} onClose={() => setSelectedReference(null)} width={detailWidth} onResize={setDetailWidth} />
 
       <footer className="atlas-footer">
         <span><CalendarDays size={14} aria-hidden="true" />{formatUpdated(catalog.generatedAt)}</span>

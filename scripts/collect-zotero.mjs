@@ -21,6 +21,7 @@ const PAGE_SIZE = 100;
 const SCREENSHOT_LIMIT = Math.max(0, Number(process.env.ZOTSCAPE_SCREENSHOT_LIMIT || 18));
 const SKIP_SCREENSHOTS = process.env.ZOTSCAPE_SKIP_SCREENSHOTS === '1';
 const GOOGLE_BOOKS_API_KEY = process.env.GOOGLE_BOOKS_API_KEY || '';
+const USE_PUBLIC_GOOGLE_BOOKS = process.env.ZOTSCAPE_ENABLE_GOOGLE_BOOKS_PUBLIC === '1';
 const ISBNDB_API_KEY = process.env.ISBNDB_API_KEY || '';
 const ATLAS_WIDTH = 3200;
 const ATLAS_HEIGHT = 2200;
@@ -315,6 +316,67 @@ function parseIsbns(value) {
     .sort((left, right) => right.length - left.length);
 }
 
+const COVER_STOP_WORDS = new Set([
+  'about', 'avec', 'book', 'dans', 'des', 'du', 'edition', 'etait', 'from',
+  'hist', 'histoire', 'humanite', 'les', 'livre', 'new', 'nouvelle', 'pour',
+  'summary', 'the', 'une', 'und', 'with',
+]);
+
+function normalizeForMatch(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/gu, '')
+    .replace(/[’'`´]/gu, ' ')
+    .replace(/&/gu, ' and ')
+    .replace(/[^a-z0-9]+/giu, ' ')
+    .toLowerCase()
+    .trim();
+}
+
+function significantTokens(value) {
+  return normalizeForMatch(value)
+    .split(/\s+/u)
+    .filter((token) => token.length >= 4 && !COVER_STOP_WORDS.has(token));
+}
+
+function creatorMatchTokens(reference) {
+  return [...new Set((reference.creators || [])
+    .flatMap((creator) => significantTokens(creator.sortName || creator.name).slice(-1))
+    .filter(Boolean))];
+}
+
+function titleOverlapScore(reference, candidateTitle) {
+  const referenceTokens = significantTokens(reference.title);
+  if (!referenceTokens.length) return 0;
+  const candidate = new Set(significantTokens(candidateTitle));
+  const shared = referenceTokens.filter((token) => candidate.has(token));
+  return shared.length / referenceTokens.length;
+}
+
+function creatorOverlapScore(reference, candidateAuthors = []) {
+  const creatorTokens = creatorMatchTokens(reference);
+  if (!creatorTokens.length) return 0;
+  const candidate = normalizeForMatch(Array.isArray(candidateAuthors) ? candidateAuthors.join(' ') : candidateAuthors);
+  return creatorTokens.filter((token) => candidate.includes(token)).length;
+}
+
+function hasReferenceIsbn(reference, candidateIsbns = []) {
+  const normalized = new Set((candidateIsbns || []).map((isbn) => String(isbn).replace(/[^0-9X]/giu, '').toUpperCase()));
+  return reference.isbns.some((isbn) => normalized.has(isbn));
+}
+
+function coverSearchQueries(reference) {
+  const creators = (reference.creators || []).map((creator) => creator.name).filter(Boolean).join(' ');
+  const shortTitle = normalizeSpace(reference.shortTitle || reference.title.split(/[:.;!?—–-]/u)[0] || reference.title);
+  const titleTokens = significantTokens(reference.title).slice(0, 4).join(' ');
+  return [...new Set([
+    reference.isbns.length ? `isbn:${reference.isbns[0]}` : '',
+    [shortTitle, creators].filter(Boolean).join(' '),
+    [titleTokens, creators].filter(Boolean).join(' '),
+    [reference.title, creators].filter(Boolean).join(' '),
+  ].map(normalizeSpace).filter(Boolean))];
+}
+
 function hostIsPrivate(hostname) {
   const host = hostname.toLowerCase();
   return host === 'localhost'
@@ -450,25 +512,63 @@ function wrapText(text, maxChars, maxLines) {
 async function generateFallbackAsset(reference) {
   const filePath = path.join(fallbackDir, `${reference.key}.svg`);
   const [bg, ink, accent] = FALLBACK_PALETTES[hashIndex(reference.key, FALLBACK_PALETTES.length)];
-  const titleLines = wrapText(reference.title || 'Sans titre', 24, 4);
-  const authorLines = wrapText(reference.creatorsLabel || '', 34, 2);
   const typeLabel = TYPE_LABELS[reference.itemType] || reference.itemType || 'Reference';
+  const family = (() => {
+    if (['film', 'videoRecording', 'tvBroadcast'].includes(reference.itemType)) return 'film';
+    if (['webpage', 'blogPost'].includes(reference.itemType)) return 'web';
+    if (['journalArticle', 'newspaperArticle', 'document', 'presentation'].includes(reference.itemType)) return 'article';
+    if (reference.itemType === 'bookSection') return 'chapter';
+    if (reference.itemType === 'thesis') return 'thesis';
+    return 'book';
+  })();
+  const spec = {
+    article: { width: 500, height: 650, pad: 42, titleChars: 27, titleLines: 4, titleY: 142, authorY: 390, yearY: 580 },
+    book: { width: 420, height: 620, pad: 42, titleChars: 23, titleLines: 4, titleY: 116, authorY: 380, yearY: 548 },
+    chapter: { width: 420, height: 560, pad: 42, titleChars: 24, titleLines: 4, titleY: 112, authorY: 342, yearY: 492 },
+    film: { width: 720, height: 420, pad: 48, titleChars: 38, titleLines: 3, titleY: 156, authorY: 292, yearY: 360 },
+    thesis: { width: 460, height: 640, pad: 44, titleChars: 25, titleLines: 4, titleY: 146, authorY: 398, yearY: 570 },
+    web: { width: 700, height: 480, pad: 44, titleChars: 38, titleLines: 3, titleY: 158, authorY: 318, yearY: 416 },
+  }[family];
+  const titleLines = wrapText(reference.title || 'Sans titre', spec.titleChars, spec.titleLines);
+  const authorLines = wrapText(reference.creatorsLabel || '', Math.max(28, spec.titleChars + 8), 2);
   const titleTspans = titleLines.map((line, index) => (
-    `<tspan x="34" y="${96 + index * 34}">${escapeXml(line)}</tspan>`
+    `<tspan x="${spec.pad}" y="${spec.titleY + index * 34}">${escapeXml(line)}</tspan>`
   )).join('');
   const authorTspans = authorLines.map((line, index) => (
-    `<tspan x="34" y="${278 + index * 22}">${escapeXml(line)}</tspan>`
+    `<tspan x="${spec.pad}" y="${spec.authorY + index * 22}">${escapeXml(line)}</tspan>`
   )).join('');
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="420" height="620" viewBox="0 0 420 620" role="img" aria-label="${escapeXml(reference.title)}">
-  <rect width="420" height="620" rx="0" fill="${bg}"/>
-  <rect x="22" y="22" width="376" height="576" rx="18" fill="none" stroke="${ink}" stroke-opacity="0.16" stroke-width="2"/>
-  <rect x="34" y="42" width="74" height="8" rx="4" fill="${accent}"/>
-  <text x="34" y="72" font-family="Inter, Arial, sans-serif" font-size="15" font-weight="700" fill="${ink}" opacity="0.72">${escapeXml(typeLabel.toUpperCase())}</text>
-  <text font-family="Georgia, 'Times New Roman', serif" font-size="30" font-weight="700" fill="${ink}" letter-spacing="0">${titleTspans}</text>
+  const motifs = {
+    article: `<rect x="24" y="20" width="${spec.width - 48}" height="${spec.height - 40}" rx="12" fill="#fff" opacity="0.34"/>
+  <rect x="42" y="48" width="7" height="${spec.height - 96}" rx="3" fill="${accent}" opacity="0.9"/>
+  <path d="M76 70h250M76 92h330M76 114h280M76 520h240M76 544h190" stroke="${ink}" stroke-opacity="0.13" stroke-width="7" stroke-linecap="round"/>`,
+    book: `<rect x="0" y="0" width="38" height="${spec.height}" fill="${ink}" opacity="0.11"/>
+  <rect x="26" y="24" width="${spec.width - 52}" height="${spec.height - 48}" rx="18" fill="none" stroke="${ink}" stroke-opacity="0.16" stroke-width="2"/>
+  <path d="M382 42v536" stroke="${ink}" stroke-opacity="0.1" stroke-width="12"/>
+  <path d="M386 42v536" stroke="#fff" stroke-opacity="0.28" stroke-width="4"/>`,
+    chapter: `<rect x="24" y="28" width="${spec.width - 48}" height="${spec.height - 56}" rx="16" fill="#fff" opacity="0.22"/>
+  <path d="M${spec.width / 2} 54v452" stroke="${ink}" stroke-opacity="0.12" stroke-width="2"/>
+  <rect x="42" y="42" width="76" height="8" rx="4" fill="${accent}" opacity="0.95"/>`,
+    film: `<rect x="22" y="28" width="${spec.width - 44}" height="${spec.height - 56}" rx="22" fill="${ink}" opacity="0.08"/>
+  <path d="M54 62h612M54 358h612" stroke="${ink}" stroke-opacity="0.2" stroke-width="10" stroke-dasharray="2 23" stroke-linecap="round"/>
+  <path d="M344 206l54 32-54 32z" fill="${accent}" opacity="0.9"/>`,
+    thesis: `<path d="M30 84h126l22 28h252v480H30z" fill="#fff" opacity="0.25"/>
+  <rect x="52" y="134" width="18" height="380" rx="9" fill="${ink}" opacity="0.1"/>
+  <path d="M96 158h246M96 182h280M96 206h210" stroke="${ink}" stroke-opacity="0.12" stroke-width="7" stroke-linecap="round"/>`,
+    web: `<rect x="24" y="28" width="${spec.width - 48}" height="${spec.height - 56}" rx="24" fill="#fff" opacity="0.28"/>
+  <rect x="44" y="52" width="${spec.width - 88}" height="36" rx="18" fill="${ink}" opacity="0.1"/>
+  <circle cx="66" cy="70" r="6" fill="${accent}"/>
+  <circle cx="86" cy="70" r="6" fill="${ink}" opacity="0.18"/>
+  <circle cx="106" cy="70" r="6" fill="${ink}" opacity="0.18"/>
+  <path d="M54 370h220M54 396h310M54 422h250" stroke="${ink}" stroke-opacity="0.12" stroke-width="8" stroke-linecap="round"/>`,
+  };
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${spec.width}" height="${spec.height}" viewBox="0 0 ${spec.width} ${spec.height}" role="img" aria-label="${escapeXml(reference.title)}">
+  <rect width="${spec.width}" height="${spec.height}" rx="0" fill="${bg}"/>
+  ${motifs[family]}
+  <rect x="${spec.pad}" y="${family === 'film' ? 96 : 62}" width="82" height="8" rx="4" fill="${accent}"/>
+  <text x="${spec.pad}" y="${family === 'film' ? 126 : 92}" font-family="Inter, Arial, sans-serif" font-size="15" font-weight="700" fill="${ink}" opacity="0.72">${escapeXml(typeLabel.toUpperCase())}</text>
+  <text font-family="Georgia, 'Times New Roman', serif" font-size="${family === 'film' || family === 'web' ? 32 : 30}" font-weight="700" fill="${ink}" letter-spacing="0">${titleTspans}</text>
   <text font-family="Inter, Arial, sans-serif" font-size="17" font-weight="600" fill="${ink}" opacity="0.72">${authorTspans}</text>
-  <text x="34" y="548" font-family="Inter, Arial, sans-serif" font-size="18" font-weight="700" fill="${ink}" opacity="0.75">${escapeXml(reference.year || 's. d.')}</text>
-  <circle cx="350" cy="540" r="36" fill="${accent}" opacity="0.9"/>
-  <text x="350" y="548" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="20" font-weight="800" fill="${bg}">Z</text>
+  <text x="${spec.pad}" y="${spec.yearY}" font-family="Inter, Arial, sans-serif" font-size="18" font-weight="700" fill="${ink}" opacity="0.75">${escapeXml(reference.year || 's. d.')}</text>
 </svg>
 `;
   await fs.writeFile(filePath, svg, 'utf8');
@@ -530,23 +630,63 @@ async function downloadImage(url, targetBasePath, options = {}) {
   return filePath;
 }
 
+function coverAsset(filePath, source, identifier) {
+  return {
+    kind: 'cover',
+    src: mediaPath(filePath),
+    source,
+    identifier,
+  };
+}
+
 async function findOpenLibraryCover(reference) {
   for (const isbn of reference.isbns) {
     const url = `https://covers.openlibrary.org/b/isbn/${encodeURIComponent(isbn)}-L.jpg?default=false`;
     const filePath = await downloadImage(url, path.join(coverDir, `${reference.key}-openlibrary-${isbn}`), { role: 'cover' }).catch(() => null);
     if (filePath) {
-      return {
-        kind: 'cover',
-        src: mediaPath(filePath),
-        source: 'openlibrary',
-        identifier: isbn,
-      };
+      return coverAsset(filePath, 'openlibrary-isbn', isbn);
+    }
+  }
+  return null;
+}
+
+async function findOpenLibrarySearchCover(reference) {
+  const queries = coverSearchQueries(reference);
+
+  for (const query of queries) {
+    const url = new URL('https://openlibrary.org/search.json');
+    url.searchParams.set('q', query);
+    url.searchParams.set('limit', '8');
+    const response = await fetchWithRetry(url, { signal: AbortSignal.timeout(30_000) }, 2).catch(() => null);
+    if (!response?.ok) continue;
+    const payload = await response.json().catch(() => null);
+    const docs = Array.isArray(payload?.docs) ? payload.docs : [];
+    for (let index = 0; index < docs.length; index += 1) {
+      const doc = docs[index];
+      if (!doc?.cover_i) continue;
+      const isbnMatch = hasReferenceIsbn(reference, doc.isbn || []);
+      const titleScore = titleOverlapScore(reference, doc.title);
+      const creatorScore = creatorOverlapScore(reference, doc.author_name || []);
+      const creatorTarget = Math.min(2, Math.max(1, creatorMatchTokens(reference).length));
+      const isStrongTitleMatch = titleScore >= 0.45 && creatorScore >= 1;
+      const isLikelyTranslation = index === 0 && creatorScore >= creatorTarget && Number(payload?.numFound || 0) <= 24;
+      if (!isbnMatch && !isStrongTitleMatch && !isLikelyTranslation) continue;
+      const coverUrl = `https://covers.openlibrary.org/b/id/${encodeURIComponent(doc.cover_i)}-L.jpg?default=false`;
+      const filePath = await downloadImage(
+        coverUrl,
+        path.join(coverDir, `${reference.key}-openlibrary-search-${doc.cover_i}`),
+        { role: 'cover' },
+      ).catch(() => null);
+      if (filePath) {
+        return coverAsset(filePath, isbnMatch ? 'openlibrary-search-isbn' : 'openlibrary-search', String(doc.cover_i));
+      }
     }
   }
   return null;
 }
 
 async function findGoogleBooksCover(reference) {
+  if (!GOOGLE_BOOKS_API_KEY && !USE_PUBLIC_GOOGLE_BOOKS) return null;
   for (const isbn of reference.isbns) {
     const url = new URL('https://www.googleapis.com/books/v1/volumes');
     url.searchParams.set('q', `isbn:${isbn}`);
@@ -561,13 +701,42 @@ async function findGoogleBooksCover(reference) {
     if (!imageUrl) continue;
     const filePath = await downloadImage(imageUrl.replace(/^http:/u, 'https:'), path.join(coverDir, `${reference.key}-google-${isbn}`), { role: 'cover' }).catch(() => null);
     if (filePath) {
-      return {
-        kind: 'cover',
-        src: mediaPath(filePath),
-        source: 'google-books',
-        identifier: isbn,
-      };
+      return coverAsset(filePath, 'google-books-isbn', isbn);
     }
+  }
+  return null;
+}
+
+async function findGoogleBooksSearchCover(reference) {
+  if (!GOOGLE_BOOKS_API_KEY && !USE_PUBLIC_GOOGLE_BOOKS) return null;
+  const query = [reference.title, ...(reference.creators || []).map((creator) => creator.name)].filter(Boolean).join(' ');
+  if (!query) return null;
+  const url = new URL('https://www.googleapis.com/books/v1/volumes');
+  url.searchParams.set('q', query);
+  url.searchParams.set('maxResults', '5');
+  url.searchParams.set('projection', 'lite');
+  if (GOOGLE_BOOKS_API_KEY) url.searchParams.set('key', GOOGLE_BOOKS_API_KEY);
+  const response = await fetchWithRetry(url, { signal: AbortSignal.timeout(30_000) }, 2).catch(() => null);
+  if (!response?.ok) return null;
+  const payload = await response.json().catch(() => null);
+  for (const item of payload?.items || []) {
+    const info = item.volumeInfo || {};
+    const isbnMatch = hasReferenceIsbn(
+      reference,
+      (info.industryIdentifiers || []).map((identifier) => identifier.identifier),
+    );
+    const titleScore = titleOverlapScore(reference, info.title);
+    const creatorScore = creatorOverlapScore(reference, info.authors || []);
+    if (!isbnMatch && !(titleScore >= 0.45 && creatorScore >= 1)) continue;
+    const links = info.imageLinks || {};
+    const imageUrl = publicUrl(links.extraLarge || links.large || links.medium || links.thumbnail || links.smallThumbnail);
+    if (!imageUrl) continue;
+    const filePath = await downloadImage(
+      imageUrl.replace(/^http:/u, 'https:'),
+      path.join(coverDir, `${reference.key}-google-search-${item.id || hashIndex(query)}`),
+      { role: 'cover' },
+    ).catch(() => null);
+    if (filePath) return coverAsset(filePath, isbnMatch ? 'google-books-search-isbn' : 'google-books-search', item.id || '');
   }
   return null;
 }
@@ -586,12 +755,7 @@ async function findIsbnDbCover(reference) {
     if (!imageUrl) continue;
     const filePath = await downloadImage(imageUrl.replace(/^http:/u, 'https:'), path.join(coverDir, `${reference.key}-isbndb-${isbn}`), { role: 'cover' }).catch(() => null);
     if (filePath) {
-      return {
-        kind: 'cover',
-        src: mediaPath(filePath),
-        source: 'isbndb',
-        identifier: isbn,
-      };
+      return coverAsset(filePath, 'isbndb', isbn);
     }
   }
   return null;
@@ -604,9 +768,14 @@ async function enrichCover(reference, assetCache) {
     const filePath = path.join(publicRoot, cached.asset.src);
     if (await exists(filePath) && await imageLooksUsable(filePath, 'cover')) return cached.asset;
   }
-  if (!reference.isbns.length) return null;
+  const canSearchByTitle = ['book', 'bookSection', 'thesis'].includes(reference.itemType)
+    && reference.title
+    && (reference.creators || []).length;
+  if (!reference.isbns.length && !canSearchByTitle) return null;
   const asset = await findOpenLibraryCover(reference)
+    || await findOpenLibrarySearchCover(reference)
     || await findGoogleBooksCover(reference)
+    || await findGoogleBooksSearchCover(reference)
     || await findIsbnDbCover(reference);
   assetCache.covers[reference.key] = { cacheKey, asset };
   return asset;
