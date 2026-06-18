@@ -3,12 +3,11 @@ import { TransformComponent, TransformWrapper } from 'react-zoom-pan-pinch';
 import {
   ArrowUpRight,
   BookOpen,
-  CalendarDays,
-  FileText,
   Globe2,
   Highlighter,
+  LayoutGrid,
   Library,
-  Link2,
+  List,
   RotateCcw,
   Search,
   SlidersHorizontal,
@@ -18,16 +17,9 @@ import {
 
 const BASE_URL = import.meta.env.BASE_URL || '/';
 const DEFAULT_LAYOUT = { width: 1800, height: 1200 };
-
-const ASSET_LABELS = {
-  archive: 'Archive web',
-  cover: 'Couverture',
-  fallback: 'Objet composé',
-  oembed: 'Média intégré',
-  'open-graph': 'Image du site',
-  'pdf-screenshot': 'PDF public',
-  screenshot: 'Capture',
-};
+const RECENT_REFERENCE_COUNT = 6;
+const VIEW_MODES = new Set(['atlas', 'list']);
+const LIST_SORTS = new Set(['recent', 'title', 'author', 'year']);
 
 const FALLBACK_PALETTES = [
   ['#f3d2c1', '#18212f', '#c4533d'],
@@ -66,6 +58,29 @@ function formatUpdated(value) {
   }
 }
 
+function readViewParams() {
+  const params = new URLSearchParams(window.location.search);
+  const view = params.get('view');
+  const sort = params.get('sort');
+  return {
+    view: VIEW_MODES.has(view) ? view : 'atlas',
+    sort: LIST_SORTS.has(sort) ? sort : 'recent',
+  };
+}
+
+function writeViewParams(view, sort, historyMode = 'replace') {
+  const url = new URL(window.location.href);
+  if (view === 'list') {
+    url.searchParams.set('view', 'list');
+    if (sort === 'recent') url.searchParams.delete('sort');
+    else url.searchParams.set('sort', sort);
+  } else {
+    url.searchParams.delete('view');
+    url.searchParams.delete('sort');
+  }
+  window.history[historyMode === 'push' ? 'pushState' : 'replaceState']({}, '', url);
+}
+
 function getSearchBlob(reference) {
   return normalize([
     reference.title,
@@ -102,8 +117,6 @@ function toggleSet(set, value) {
 }
 
 function referenceMatchesFeature(reference, feature) {
-  if (feature === 'pdf') return reference.attachments?.hasPdf;
-  if (feature === 'url') return Boolean(reference.url || reference.doiUrl);
   if (feature === 'annotations') return reference.annotations?.count > 0 || reference.notes?.length > 0;
   if (feature === 'shared') return reference.memoirKeys?.length > 1;
   return true;
@@ -160,14 +173,14 @@ function supportType(reference) {
   return 'document';
 }
 
-function objectDimensions(reference) {
+function objectDimensions(reference, featured = false) {
   const type = supportType(reference);
   const assetKind = reference.asset?.kind || 'fallback';
   const shared = reference.memoirKeys?.length > 1;
   const seed = hashValue(reference.key || reference.title);
-  const scale = (shared ? 1.04 : 1) * ([0.96, 1, 1.04][seed % 3]);
-  const captionHeight = 66;
-  const gap = 12;
+  const scale = (shared ? 1.04 : 1) * ([0.96, 1, 1.04][seed % 3]) * (featured ? 1.1 : 1);
+  const captionHeight = featured ? 98 : 80;
+  const gap = 10;
   if (assetKind === 'cover' && ['book', 'chapter', 'thesis'].includes(type)) {
     const ratio = clamp(Number(reference.asset?.ratio || 0.66), 0.42, 0.9);
     const mediaHeightBase = {
@@ -176,7 +189,7 @@ function objectDimensions(reference) {
       thesis: shared ? 370 : 344,
     }[type];
     const mediaHeight = Math.round(mediaHeightBase * scale);
-    const width = Math.round(clamp(mediaHeight * ratio + 14, type === 'chapter' ? 176 : 190, type === 'thesis' ? 290 : 300));
+    const width = Math.round(clamp(mediaHeight * ratio, type === 'chapter' ? 176 : 190, type === 'thesis' ? 276 : 286));
     return {
       width,
       height: mediaHeight + gap + captionHeight,
@@ -203,36 +216,83 @@ function objectDimensions(reference) {
   };
 }
 
-function packReferences(references, viewport) {
+function addedTimestamp(reference) {
+  const timestamp = Date.parse(reference.dateAdded || '');
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function sortByRecent(left, right) {
+  return addedTimestamp(right) - addedTimestamp(left)
+    || left.title.localeCompare(right.title, 'fr')
+    || left.key.localeCompare(right.key);
+}
+
+function sortListReferences(references, sort) {
+  return [...references].sort((left, right) => {
+    if (sort === 'title') {
+      return left.title.localeCompare(right.title, 'fr')
+        || left.creatorsLabel.localeCompare(right.creatorsLabel, 'fr')
+        || left.key.localeCompare(right.key);
+    }
+    if (sort === 'author') {
+      return left.creatorsLabel.localeCompare(right.creatorsLabel, 'fr')
+        || left.title.localeCompare(right.title, 'fr')
+        || left.key.localeCompare(right.key);
+    }
+    if (sort === 'year') {
+      const leftYear = Number.parseInt(left.year, 10);
+      const rightYear = Number.parseInt(right.year, 10);
+      const leftHasYear = Number.isFinite(leftYear);
+      const rightHasYear = Number.isFinite(rightYear);
+      if (leftHasYear !== rightHasYear) return leftHasYear ? -1 : 1;
+      if (leftHasYear && rightHasYear && leftYear !== rightYear) return rightYear - leftYear;
+      return left.title.localeCompare(right.title, 'fr') || left.key.localeCompare(right.key);
+    }
+    return sortByRecent(left, right);
+  });
+}
+
+function packReferences(references, viewport, recentKeys) {
   const compact = viewport.width < 760;
-  const margin = compact ? 72 : 110;
+  const margin = compact ? 64 : 104;
   const tableWidth = clamp(
-    viewport.width * (compact ? 2.55 : 1.42),
-    compact ? 1120 : 1840,
-    compact ? 1440 : 2240,
+    viewport.width * (compact ? 3.25 : 1.52),
+    compact ? 1260 : 1900,
+    compact ? 1520 : 2300,
   );
-  const panelHeight = compact ? 1580 : 1680;
+  const tableBaseHeight = compact ? 2580 : 2280;
   const anchors = [
-    [0.08, 0.08], [0.23, 0.02], [0.39, 0.10], [0.58, 0.08], [0.78, 0.15],
-    [0.03, 0.26], [0.22, 0.27], [0.43, 0.30], [0.66, 0.28], [0.82, 0.35],
-    [0.12, 0.46], [0.33, 0.43], [0.53, 0.49], [0.74, 0.50],
-    [0.05, 0.66], [0.24, 0.63], [0.46, 0.70], [0.67, 0.65], [0.84, 0.74],
-    [0.18, 0.84], [0.40, 0.88], [0.61, 0.82], [0.79, 0.90],
+    [0.38, 0.19], [0.53, 0.14], [0.66, 0.25],
+    [0.35, 0.39], [0.52, 0.42], [0.68, 0.45],
+    [0.06, 0.06], [0.22, 0.03], [0.78, 0.05], [0.88, 0.18],
+    [0.05, 0.24], [0.19, 0.30], [0.83, 0.35], [0.91, 0.50],
+    [0.04, 0.46], [0.18, 0.52], [0.32, 0.59], [0.51, 0.61],
+    [0.72, 0.60], [0.86, 0.67], [0.07, 0.68], [0.23, 0.75],
+    [0.43, 0.76], [0.63, 0.78], [0.81, 0.82], [0.12, 0.89],
+    [0.34, 0.92], [0.57, 0.91], [0.78, 0.94], [0.94, 0.74],
+    [0.50, 0.02], [0.02, 0.82], [0.94, 0.31],
   ];
   const placedLayouts = [];
+  const orderedReferences = [...references].sort((left, right) => {
+    const recentDifference = Number(recentKeys.has(right.key)) - Number(recentKeys.has(left.key));
+    if (recentDifference) return recentDifference;
+    return sortByRecent(left, right);
+  });
   const collides = (layout) => placedLayouts.some((placed) => (
-    layout.x < placed.x + placed.width + 34
-    && layout.x + layout.width + 34 > placed.x
-    && layout.y < placed.y + placed.height + 34
-    && layout.y + layout.height + 34 > placed.y
+    layout.x < placed.x + placed.width + 42
+    && layout.x + layout.width + 42 > placed.x
+    && layout.y < placed.y + placed.height + 42
+    && layout.y + layout.height + 42 > placed.y
   ));
-  const items = references.map((reference, index) => {
-    const size = objectDimensions(reference);
+  const items = orderedReferences.map((reference, index) => {
+    const featured = recentKeys.has(reference.key);
+    const size = objectDimensions(reference, featured);
     const seed = hashValue(`${reference.key}:${index}`);
     const anchor = anchors[index % anchors.length];
     const panel = Math.floor(index / anchors.length);
-    const jitterX = Math.round((((seed % 100) / 100) - 0.5) * (compact ? 58 : 92));
-    const jitterY = Math.round(((((seed >> 8) % 100) / 100) - 0.5) * (compact ? 52 : 86));
+    const jitterX = Math.round((((seed % 100) / 100) - 0.5) * (featured ? 34 : compact ? 54 : 82));
+    const jitterY = Math.round(((((seed >> 8) % 100) / 100) - 0.5) * (featured ? 32 : compact ? 48 : 76));
+    const panelOffset = panel * tableBaseHeight;
     const layout = {
       index: index + 1,
       x: clamp(
@@ -240,13 +300,14 @@ function packReferences(references, viewport) {
         margin,
         Math.max(margin, tableWidth - margin - size.width),
       ),
-      y: Math.max(margin, Math.round(margin + panel * panelHeight + anchor[1] * panelHeight + jitterY)),
+      y: Math.max(margin, Math.round(margin + panelOffset + anchor[1] * tableBaseHeight + jitterY)),
       width: size.width,
       height: size.height,
       mediaHeight: size.mediaHeight,
       captionHeight: size.captionHeight,
       rotation: 0,
-      layer: reference.memoirKeys?.length > 1 ? 3 : 1,
+      layer: featured ? 4 : reference.memoirKeys?.length > 1 ? 3 : 1,
+      featured,
     };
     let guard = 0;
     const shifts = [
@@ -261,7 +322,7 @@ function packReferences(references, viewport) {
         margin,
         Math.max(margin, tableWidth - margin - size.width),
       );
-      layout.y = Math.max(margin, Math.round(margin + panel * panelHeight + anchor[1] * panelHeight + jitterY + shift[1] + pass * 92));
+      layout.y = Math.max(margin, Math.round(margin + panelOffset + anchor[1] * tableBaseHeight + jitterY + shift[1] + pass * 96));
       guard += 1;
     }
     placedLayouts.push(layout);
@@ -273,10 +334,10 @@ function packReferences(references, viewport) {
       for (let nextIndex = index + 1; nextIndex < placedLayouts.length; nextIndex += 1) {
         const current = placedLayouts[index];
         const next = placedLayouts[nextIndex];
-        const overlaps = current.x < next.x + next.width + 34
-          && current.x + current.width + 34 > next.x
-          && current.y < next.y + next.height + 34
-          && current.y + current.height + 34 > next.y;
+        const overlaps = current.x < next.x + next.width + 42
+          && current.x + current.width + 42 > next.x
+          && current.y < next.y + next.height + 42
+          && current.y + current.height + 42 > next.y;
         if (overlaps) {
           const lower = current.y <= next.y ? next : current;
           const upper = lower === next ? current : next;
@@ -297,41 +358,15 @@ function packReferences(references, viewport) {
   };
 }
 
-function centerOf(item) {
-  const layout = item.layout;
-  return {
-    x: layout.x + layout.width / 2,
-    y: layout.y + layout.height / 2,
-  };
-}
-
 function sharesMemoir(left, right) {
   return (left.memoirKeys || []).some((key) => (right.memoirKeys || []).includes(key));
 }
 
-function buildRelationLines(activeReference, references) {
-  if (!activeReference) return [];
-  const activeItem = references.find((item) => item.reference.key === activeReference.key);
-  if (!activeItem) return [];
-  const from = centerOf(activeItem);
-  return references
-    .filter(({ reference }) => reference.key !== activeReference.key && sharesMemoir(activeReference, reference))
-    .map((item) => ({
-      key: `${activeReference.key}-${item.reference.key}`,
-      from,
-      to: centerOf(item),
-      shared: activeReference.memoirKeys.filter((key) => item.reference.memoirKeys.includes(key)).length,
-    }));
-}
 
 function sourceHref(reference) {
   return reference.url || reference.doiUrl || reference.zoteroUrl;
 }
 
-function assetLabel(reference) {
-  if (reference.embed && reference.asset?.kind === 'oembed') return 'Média intégré';
-  return ASSET_LABELS[reference.asset?.kind] || 'Image';
-}
 
 function fallbackPalette(reference) {
   const [paper, ink, accent] = FALLBACK_PALETTES[hashValue(reference.key || reference.title) % FALLBACK_PALETTES.length];
@@ -376,6 +411,111 @@ function FeatureToggle({ active, icon: Icon, label, onClick }) {
       <Icon size={15} aria-hidden="true" />
       <span>{label}</span>
     </button>
+  );
+}
+
+function ViewSwitcher({ value, onChange }) {
+  return (
+    <div className="view-switcher" role="group" aria-label="Mode d’affichage">
+      <button
+        type="button"
+        aria-pressed={value === 'atlas'}
+        aria-label="Vue atlas"
+        title="Vue atlas"
+        onClick={() => onChange('atlas')}
+      >
+        <LayoutGrid size={17} aria-hidden="true" />
+        <span>Atlas</span>
+      </button>
+      <button
+        type="button"
+        aria-pressed={value === 'list'}
+        aria-label="Vue liste"
+        title="Vue liste"
+        onClick={() => onChange('list')}
+      >
+        <List size={18} aria-hidden="true" />
+        <span>Liste</span>
+      </button>
+    </div>
+  );
+}
+
+function ListVisual({ reference }) {
+  if (reference.asset?.kind === 'fallback') {
+    return (
+      <span className={`list-fallback list-fallback--${supportType(reference)}`} style={fallbackPalette(reference)}>
+        <span>{reference.typeLabel}</span>
+      </span>
+    );
+  }
+  if (!reference.asset?.src) return null;
+  return <img src={assetUrl(reference.asset.src)} alt="" loading="lazy" />;
+}
+
+function ReferenceListRow({ reference, active, recent, onSelect }) {
+  const annotationCount = reference.annotations?.count || 0;
+  const noteCount = reference.notes?.length || 0;
+  return (
+    <li className={`reference-list-item${active ? ' is-active' : ''}${recent ? ' is-recent' : ''}`}>
+      <button
+        className="reference-list-row"
+        type="button"
+        onClick={() => onSelect(reference)}
+        aria-label={`${reference.title}, ${reference.creatorsLabel}`}
+      >
+        <span className={`reference-list-visual reference-list-visual--${supportType(reference)}`}>
+          <ListVisual reference={reference} />
+        </span>
+        <span className="reference-list-copy">
+          <span className="reference-list-heading">
+            <strong>{reference.title}</strong>
+            {recent && <em>Ajout récent</em>}
+          </span>
+          <span className="reference-list-author">{reference.creatorsLabel}</span>
+          <span className="reference-list-meta">
+            <span>{reference.typeLabel}{reference.year ? ` · ${reference.year}` : ''}</span>
+            {annotationCount > 0 && <span>{annotationCount} surligne{annotationCount > 1 ? 's' : ''}</span>}
+            {noteCount > 0 && <span>{noteCount} note{noteCount > 1 ? 's' : ''}</span>}
+          </span>
+          {(reference.memoirNames || []).length > 0 && (
+            <span className="reference-list-memoirs">
+              {(reference.memoirNames || []).map((name) => <span key={name}>{name}</span>)}
+            </span>
+          )}
+        </span>
+      </button>
+    </li>
+  );
+}
+
+function ReferenceList({ references, sort, onSortChange, recentKeys, selectedReference, onSelect }) {
+  return (
+    <section className="reference-list-view" aria-label="Liste des références">
+      <div className="reference-list-toolbar">
+        <p>{references.length} référence{references.length > 1 ? 's' : ''}</p>
+        <label>
+          <span>Trier par</span>
+          <select value={sort} onChange={(event) => onSortChange(event.target.value)}>
+            <option value="recent">Ajouts récents</option>
+            <option value="title">Titre</option>
+            <option value="author">Auteur</option>
+            <option value="year">Année</option>
+          </select>
+        </label>
+      </div>
+      <ol className="reference-list">
+        {references.map((reference) => (
+          <ReferenceListRow
+            key={reference.key}
+            reference={reference}
+            active={selectedReference?.key === reference.key}
+            recent={recentKeys.has(reference.key)}
+            onSelect={onSelect}
+          />
+        ))}
+      </ol>
+    </section>
   );
 }
 
@@ -426,7 +566,11 @@ function ToolPanel({
           <span>Mémoire</span>
           <select value={activeMemoir} onChange={(event) => setActiveMemoir(event.target.value)}>
             <option value="">Tous</option>
-            {memoirs.map((memoir) => <option key={memoir.key} value={memoir.key}>{memoir.name}</option>)}
+            {memoirs.map((memoir) => (
+              <option key={memoir.key} value={memoir.key}>
+                {memoir.name} ({memoir.referenceCount})
+              </option>
+            ))}
           </select>
         </label>
 
@@ -438,20 +582,21 @@ function ToolPanel({
           </select>
         </label>
 
-        <label className="tool-field">
-          <span>Année</span>
-          <select value={yearFilter} onChange={(event) => setYearFilter(event.target.value)}>
-            <option value="">Toutes</option>
-            {allYearOptions.map((year) => <option key={year} value={year}>{year}</option>)}
-          </select>
-        </label>
-
-        <div className="tool-cluster" aria-label="Filtres">
-          <FeatureToggle active={featureFilters.has('pdf')} icon={FileText} label="PDF" onClick={() => setFeatureFilters(toggleSet(featureFilters, 'pdf'))} />
-          <FeatureToggle active={featureFilters.has('url')} icon={Link2} label="Lien" onClick={() => setFeatureFilters(toggleSet(featureFilters, 'url'))} />
-          <FeatureToggle active={featureFilters.has('annotations')} icon={Highlighter} label="Surlignes" onClick={() => setFeatureFilters(toggleSet(featureFilters, 'annotations'))} />
-          <FeatureToggle active={featureFilters.has('shared')} icon={UsersRound} label="Croisées" onClick={() => setFeatureFilters(toggleSet(featureFilters, 'shared'))} />
+        <div className="tool-cluster" aria-label="Filtres lecteurs">
+          <FeatureToggle active={featureFilters.has('annotations')} icon={Highlighter} label="Avec surlignes" onClick={() => setFeatureFilters(toggleSet(featureFilters, 'annotations'))} />
+          <FeatureToggle active={featureFilters.has('shared')} icon={UsersRound} label="Références communes" onClick={() => setFeatureFilters(toggleSet(featureFilters, 'shared'))} />
         </div>
+
+        <details className="secondary-filters" open={Boolean(yearFilter)}>
+          <summary>Plus de filtres</summary>
+          <label className="tool-field">
+            <span>Année</span>
+            <select value={yearFilter} onChange={(event) => setYearFilter(event.target.value)}>
+              <option value="">Toutes</option>
+              {allYearOptions.map((year) => <option key={year} value={year}>{year}</option>)}
+            </select>
+          </label>
+        </details>
 
         <button className="reset-button" type="button" onClick={onReset}>
           <RotateCcw size={16} aria-hidden="true" />
@@ -462,14 +607,14 @@ function ToolPanel({
   );
 }
 
-function AtlasObject({ reference, layout, active, related, onSelect, onHover }) {
+function AtlasObject({ reference, layout, active, related, recent, onSelect, onHover }) {
   const assetKind = reference.asset?.kind || 'fallback';
   const type = supportType(reference);
   const transform = `translate(${layout.x}px, ${layout.y}px)`;
 
   return (
     <article
-      className={`atlas-object atlas-object--${assetKind} atlas-object--${type}${active ? ' is-active' : ''}${related ? ' is-related' : ''}`}
+      className={`atlas-object atlas-object--${assetKind} atlas-object--${type}${active ? ' is-active' : ''}${related ? ' is-related' : ''}${recent ? ' is-recent' : ''}`}
       style={{
         width: layout.width,
         height: layout.height,
@@ -481,46 +626,37 @@ function AtlasObject({ reference, layout, active, related, onSelect, onHover }) 
       onMouseEnter={() => onHover(reference.key)}
       onMouseLeave={() => onHover('')}
     >
-      <button className="atlas-object-main" type="button" onClick={() => onSelect(reference)}>
+      <button
+        className="atlas-object-main"
+        type="button"
+        onClick={() => onSelect(reference)}
+        aria-label={`${reference.title}, ${reference.creatorsLabel}`}
+      >
         <span className="object-media">
           <ReferenceVisual reference={reference} />
         </span>
       </button>
       <div className="object-caption">
         <p>{reference.title}</p>
-        <span>{reference.typeLabel}{reference.year ? ` / ${reference.year}` : ''}</span>
+        <span>{reference.creatorsLabel}</span>
+        {recent && <em>Ajout récent</em>}
       </div>
     </article>
   );
 }
 
-function RelationLayer({ lines, width, height }) {
-  return (
-    <svg className="relation-layer" width={width} height={height} viewBox={`0 0 ${width} ${height}`} aria-hidden="true">
-      {lines.map((line) => (
-        <line
-          key={line.key}
-          x1={line.from.x}
-          y1={line.from.y}
-          x2={line.to.x}
-          y2={line.to.y}
-          strokeWidth={line.shared > 1 ? 2.4 : 1.5}
-        />
-      ))}
-    </svg>
-  );
-}
-
 function MiniMap({ items, layout, activeKey, transformState, viewport }) {
-  const width = 260;
-  const height = Math.round(width * (layout.height / layout.width));
-  const scale = width / layout.width;
+  const compact = viewport.width < 760;
+  const width = compact ? 96 : 150;
+  const height = compact ? 68 : 105;
+  const scaleX = width / layout.width;
+  const scaleY = height / layout.height;
   const rawView = transformState?.scale
     ? {
-      x: (-transformState.positionX / transformState.scale) * scale,
-      y: (-transformState.positionY / transformState.scale) * scale,
-      width: (viewport.width / transformState.scale) * scale,
-      height: (viewport.height / transformState.scale) * scale,
+      x: (-transformState.positionX / transformState.scale) * scaleX,
+      y: (-transformState.positionY / transformState.scale) * scaleY,
+      width: (viewport.width / transformState.scale) * scaleX,
+      height: (viewport.height / transformState.scale) * scaleY,
     }
     : null;
   const view = rawView && {
@@ -538,10 +674,10 @@ function MiniMap({ items, layout, activeKey, transformState, viewport }) {
             key={reference.key}
             className={`mini-map-item${reference.key === activeKey ? ' is-active' : ''}`}
             style={{
-              left: item.x * scale,
-              top: item.y * scale,
-              width: Math.max(5, item.width * scale),
-              height: Math.max(5, item.height * scale),
+              left: item.x * scaleX,
+              top: item.y * scaleY,
+              width: Math.max(3, item.width * scaleX),
+              height: Math.max(3, item.height * scaleY),
             }}
           >
             <MiniMapVisual reference={reference} />
@@ -553,7 +689,7 @@ function MiniMap({ items, layout, activeKey, transformState, viewport }) {
   );
 }
 
-function DetailPanel({ reference, onClose, width, onResize }) {
+function DetailPanel({ reference, onClose }) {
   useEffect(() => {
     if (!reference) return undefined;
     const handleKey = (event) => {
@@ -571,29 +707,10 @@ function DetailPanel({ reference, onClose, width, onResize }) {
   const embedHtml = embedSrc ? '' : reference.embed?.html || '';
   const canEmbed = Boolean(embedSrc || embedHtml);
   const siteEmbed = canEmbed && type === 'web';
-  const siteScale = clamp((width - 40) / 1120, 0.28, 0.68);
-
-  const startResize = (event) => {
-    event.preventDefault();
-    const startX = event.clientX;
-    const startWidth = width;
-    const handleMove = (moveEvent) => {
-      const maxWidth = Math.min(window.innerWidth - 24, 820);
-      onResize(clamp(startWidth + startX - moveEvent.clientX, 360, maxWidth));
-    };
-    const handleUp = () => {
-      window.removeEventListener('pointermove', handleMove);
-      window.removeEventListener('pointerup', handleUp);
-    };
-    window.addEventListener('pointermove', handleMove);
-    window.addEventListener('pointerup', handleUp);
-  };
 
   return (
-    <aside className="detail-panel" role="dialog" aria-modal="false" aria-label={reference.title} style={{ '--detail-width': `${width}px` }}>
-      <button className="detail-resizer" type="button" aria-label="Redimensionner le volet" onPointerDown={startResize} />
-      <div className="panel-head">
-        <span>{reference.typeLabel}{reference.year ? ` / ${reference.year}` : ''}</span>
+    <aside className="detail-panel" role="dialog" aria-modal="false" aria-label={reference.title}>
+      <div className="detail-panel-head">
         <button className="icon-button" type="button" onClick={onClose} aria-label="Fermer">
           <X size={20} />
         </button>
@@ -601,7 +718,7 @@ function DetailPanel({ reference, onClose, width, onResize }) {
 
       <div className={`detail-media detail-media--${assetKind} detail-media--${type}${canEmbed ? ' detail-media--embed' : ''}`}>
         {canEmbed ? (
-          <div className={`embed-stage${siteEmbed ? ' embed-stage--site' : ''}`} style={siteEmbed ? { '--site-scale': siteScale } : undefined}>
+          <div className={`embed-stage${siteEmbed ? ' embed-stage--site' : ''}`}>
             <iframe
               title={reference.embed?.title || reference.title}
               src={embedSrc || undefined}
@@ -621,6 +738,15 @@ function DetailPanel({ reference, onClose, width, onResize }) {
         <p className="detail-authors">{reference.creatorsLabel}</p>
 
         {reference.abstract && <p className="detail-abstract">{reference.abstract}</p>}
+
+        {(reference.memoirNames || []).length > 0 && (
+          <section className="detail-collections">
+            <p>Mobilisé dans</p>
+            <div className="detail-rubrics">
+              {(reference.memoirNames || []).map((name) => <span key={name}>{name}</span>)}
+            </div>
+          </section>
+        )}
 
         {(reference.annotations?.count > 0 || reference.notes?.length > 0) && (
           <section className="annotation-section">
@@ -664,18 +790,18 @@ function DetailPanel({ reference, onClose, width, onResize }) {
           )}
         </div>
 
-        <dl className="detail-meta">
-          <dt>Visuel</dt><dd>{assetLabel(reference)}</dd>
-          {reference.publisher && <><dt>Édition</dt><dd>{reference.publisher}</dd></>}
-          {reference.publicationTitle && <><dt>Revue</dt><dd>{reference.publicationTitle}</dd></>}
-          {reference.bookTitle && <><dt>Dans</dt><dd>{reference.bookTitle}</dd></>}
-          {reference.isbn && <><dt>ISBN</dt><dd>{reference.isbn}</dd></>}
-          {reference.doi && <><dt>DOI</dt><dd>{reference.doi}</dd></>}
-        </dl>
-
-        <div className="detail-rubrics">
-          {(reference.memoirNames || []).map((name) => <span key={name}>{name}</span>)}
-        </div>
+        <details className="detail-bibliography">
+          <summary>Informations bibliographiques</summary>
+          <dl className="detail-meta">
+            <dt>Type</dt><dd>{reference.typeLabel}</dd>
+            {reference.year && <><dt>Année</dt><dd>{reference.year}</dd></>}
+            {reference.publisher && <><dt>Édition</dt><dd>{reference.publisher}</dd></>}
+            {reference.publicationTitle && <><dt>Revue</dt><dd>{reference.publicationTitle}</dd></>}
+            {reference.bookTitle && <><dt>Dans</dt><dd>{reference.bookTitle}</dd></>}
+            {reference.isbn && <><dt>ISBN</dt><dd>{reference.isbn}</dd></>}
+            {reference.doi && <><dt>DOI</dt><dd>{reference.doi}</dd></>}
+          </dl>
+        </details>
       </div>
     </aside>
   );
@@ -700,7 +826,8 @@ export default function App() {
   const [featureFilters, setFeatureFilters] = useState(new Set());
   const [toolsOpen, setToolsOpen] = useState(false);
   const [selectedReference, setSelectedReference] = useState(null);
-  const [detailWidth, setDetailWidth] = useState(460);
+  const [viewMode, setViewMode] = useState(() => readViewParams().view);
+  const [listSort, setListSort] = useState(() => readViewParams().sort);
   const [hoveredKey, setHoveredKey] = useState('');
   const [transformState, setTransformState] = useState({ scale: 1, positionX: 0, positionY: 0 });
   const [viewport, setViewport] = useState({ width: 1280, height: 720 });
@@ -730,6 +857,19 @@ export default function App() {
     return () => window.removeEventListener('resize', updateViewport);
   }, []);
 
+  useEffect(() => {
+    const current = readViewParams();
+    writeViewParams(current.view, current.sort, 'replace');
+    const handlePopState = () => {
+      const next = readViewParams();
+      setViewMode(next.view);
+      setListSort(next.sort);
+      setHoveredKey('');
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
+
   const references = catalog?.references || [];
   const memoirs = catalog?.memoirs || [];
 
@@ -747,7 +887,20 @@ export default function App() {
     });
   }, [activeMemoir, featureFilters, query, references, typeFilter, yearFilter]);
 
-  const packed = useMemo(() => packReferences(filteredReferences, viewport), [filteredReferences, viewport]);
+  const recentKeys = useMemo(() => new Set(
+    [...references]
+      .sort(sortByRecent)
+      .slice(0, RECENT_REFERENCE_COUNT)
+      .map((reference) => reference.key),
+  ), [references]);
+  const sortedListReferences = useMemo(
+    () => sortListReferences(filteredReferences, listSort),
+    [filteredReferences, listSort],
+  );
+  const packed = useMemo(
+    () => packReferences(filteredReferences, viewport, recentKeys),
+    [filteredReferences, recentKeys, viewport],
+  );
   const visibleItems = packed.items;
   const layout = packed.layout || catalog?.layout || DEFAULT_LAYOUT;
   const fixedScale = useMemo(() => {
@@ -760,10 +913,9 @@ export default function App() {
   }, [layout.width, viewport.width]);
 
   const activeReference = selectedReference || references.find((reference) => reference.key === hoveredKey) || null;
-  const relatedKeys = useMemo(() => new Set(activeReference
-    ? filteredReferences.filter((reference) => reference.key !== activeReference.key && sharesMemoir(activeReference, reference)).map((reference) => reference.key)
-    : []), [activeReference, filteredReferences]);
-  const relationLines = useMemo(() => buildRelationLines(activeReference, visibleItems), [activeReference, visibleItems]);
+  const relatedKeys = useMemo(() => new Set(selectedReference
+    ? filteredReferences.filter((reference) => reference.key !== selectedReference.key && sharesMemoir(selectedReference, reference)).map((reference) => reference.key)
+    : []), [filteredReferences, selectedReference]);
   const allTypeOptions = useMemo(() => typeOptions(references), [references]);
   const allYearOptions = useMemo(() => yearOptions(references), [references]);
   const toolCount = activeToolCount({ activeMemoir, query, typeFilter, yearFilter, featureFilters });
@@ -776,6 +928,13 @@ export default function App() {
   }, [fixedScale]);
 
   useEffect(() => {
+    if (selectedReference && !filteredReferences.some((reference) => reference.key === selectedReference.key)) {
+      setSelectedReference(null);
+    }
+  }, [filteredReferences, selectedReference]);
+
+  useEffect(() => {
+    if (viewMode !== 'atlas') return undefined;
     let frame = 0;
     let observer = null;
     const syncTransform = () => {
@@ -805,7 +964,20 @@ export default function App() {
       window.cancelAnimationFrame(frame);
       observer?.disconnect();
     };
-  }, [fixedScale, layout.height, layout.width, visibleItems.length]);
+  }, [fixedScale, layout.height, layout.width, viewMode, visibleItems.length]);
+
+  function changeViewMode(nextView) {
+    if (!VIEW_MODES.has(nextView) || nextView === viewMode) return;
+    setViewMode(nextView);
+    setHoveredKey('');
+    writeViewParams(nextView, listSort, 'push');
+  }
+
+  function changeListSort(nextSort) {
+    if (!LIST_SORTS.has(nextSort) || nextSort === listSort) return;
+    setListSort(nextSort);
+    writeViewParams(viewMode, nextSort, 'replace');
+  }
 
   function resetTools() {
     setActiveMemoir('');
@@ -840,56 +1012,78 @@ export default function App() {
   return (
     <main className="app-shell">
       <header className="atlas-header">
-        <a className="brand-link" href={catalog.source.groupUrl} target="_blank" rel="noreferrer">
-          <Library size={20} aria-hidden="true" />
-          <span>EnsadNancy</span>
-        </a>
-        <div className="atlas-title">
-          <h1>{catalog.source.rootCollectionName}</h1>
-          <p>{filteredReferences.length} objets / {catalog.stats.referenceCount} références / {catalog.stats.annotationCount} surlignes</p>
+        <div className="atlas-heading">
+          <a className="brand-link" href={catalog.source.groupUrl} target="_blank" rel="noreferrer">
+            <Library size={17} aria-hidden="true" />
+            <span>EnsadNancy</span>
+          </a>
+          <div className="atlas-title">
+            <h1>{catalog.source.rootCollectionName}</h1>
+            <p>
+              {filteredReferences.length === catalog.stats.referenceCount
+                ? `${catalog.stats.referenceCount} références`
+                : `${filteredReferences.length} sur ${catalog.stats.referenceCount} références`}
+              {' · '}{catalog.stats.memoirCount} mémoires en cours
+              {' · '}mis à jour le {formatUpdated(catalog.generatedAt)}
+            </p>
+          </div>
         </div>
-        <button className="tools-toggle" type="button" onClick={() => setToolsOpen(true)}>
-          <SlidersHorizontal size={18} aria-hidden="true" />
-          <span>Filtres</span>
-          {toolCount > 0 && <em>{toolCount}</em>}
-        </button>
+        <div className="atlas-actions">
+          <ViewSwitcher value={viewMode} onChange={changeViewMode} />
+          <button className="tools-toggle" type="button" onClick={() => setToolsOpen(true)}>
+            <SlidersHorizontal size={18} aria-hidden="true" />
+            <span>Filtres</span>
+            {toolCount > 0 && <em>{toolCount}</em>}
+          </button>
+        </div>
       </header>
 
       {filteredReferences.length ? (
-        <TransformWrapper
-          key={`${Math.round(fixedScale * 100)}-${layout.width}-${layout.height}-${filteredReferences.map((reference) => reference.key).join('-')}`}
-          initialScale={fixedScale}
-          minScale={fixedScale}
-          maxScale={fixedScale}
-          centerOnInit
-          limitToBounds={false}
-          wheel={{ disabled: true }}
-          pinch={{ disabled: true }}
-          doubleClick={{ disabled: true }}
-          onTransformed={(_, state) => setTransformState(state)}
-        >
-          {() => (
-            <>
-              <MiniMap items={visibleItems} layout={layout} activeKey={activeReference?.key || ''} transformState={transformState} viewport={viewport} />
-              <TransformComponent wrapperClass="atlas-wrapper" contentClass="atlas-content">
-                <section className="atlas-surface" style={{ width: layout.width, height: layout.height }} aria-label="Table de références">
-                  <RelationLayer lines={relationLines} width={layout.width} height={layout.height} />
-                  {visibleItems.map(({ reference, layout: itemLayout }) => (
-                    <AtlasObject
-                      key={reference.key}
-                      reference={reference}
-                      layout={itemLayout}
-                      active={activeReference?.key === reference.key}
-                      related={relatedKeys.has(reference.key)}
-                      onSelect={setSelectedReference}
-                      onHover={setHoveredKey}
-                    />
-                  ))}
-                </section>
-              </TransformComponent>
-            </>
-          )}
-        </TransformWrapper>
+        viewMode === 'atlas' ? (
+          <TransformWrapper
+            key={`${Math.round(fixedScale * 100)}-${layout.width}-${layout.height}-${filteredReferences.map((reference) => reference.key).join('-')}`}
+            initialScale={fixedScale}
+            minScale={fixedScale}
+            maxScale={fixedScale}
+            centerOnInit
+            limitToBounds={false}
+            wheel={{ disabled: true }}
+            pinch={{ disabled: true }}
+            doubleClick={{ disabled: true }}
+            onTransformed={(_, state) => setTransformState(state)}
+          >
+            {() => (
+              <>
+                <MiniMap items={visibleItems} layout={layout} activeKey={activeReference?.key || ''} transformState={transformState} viewport={viewport} />
+                <TransformComponent wrapperClass="atlas-wrapper" contentClass="atlas-content">
+                  <section className="atlas-surface" style={{ width: layout.width, height: layout.height }} aria-label="Table de références">
+                    {visibleItems.map(({ reference, layout: itemLayout }) => (
+                      <AtlasObject
+                        key={reference.key}
+                        reference={reference}
+                        layout={itemLayout}
+                        active={activeReference?.key === reference.key}
+                        related={relatedKeys.has(reference.key)}
+                        recent={recentKeys.has(reference.key)}
+                        onSelect={setSelectedReference}
+                        onHover={setHoveredKey}
+                      />
+                    ))}
+                  </section>
+                </TransformComponent>
+              </>
+            )}
+          </TransformWrapper>
+        ) : (
+          <ReferenceList
+            references={sortedListReferences}
+            sort={listSort}
+            onSortChange={changeListSort}
+            recentKeys={recentKeys}
+            selectedReference={selectedReference}
+            onSelect={setSelectedReference}
+          />
+        )
       ) : (
         <EmptyState />
       )}
@@ -913,12 +1107,7 @@ export default function App() {
         onReset={resetTools}
       />
 
-      <DetailPanel reference={selectedReference} onClose={() => setSelectedReference(null)} width={detailWidth} onResize={setDetailWidth} />
-
-      <footer className="atlas-footer">
-        <span><CalendarDays size={14} aria-hidden="true" />{formatUpdated(catalog.generatedAt)}</span>
-        <span>Images et médias chargés à la demande</span>
-      </footer>
+      <DetailPanel reference={selectedReference} onClose={() => setSelectedReference(null)} />
     </main>
   );
 }
