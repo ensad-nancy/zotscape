@@ -1,55 +1,38 @@
 # Zotscape
 
-Interface statique React/Vite pour parcourir visuellement les références du groupe Zotero public EnsadNancy.
+Interface React/Vite pour explorer les références du groupe Zotero public EnsadNancy sous forme d’atlas ou de liste éditoriale.
 
-## Commandes
+Le site est entièrement statique : les données et médias sont générés avant le build, puis publiés sur GitHub Pages.
+
+## Développement
 
 ```sh
 npm install
-npm run collect
+npm run collect:fast
 npm run dev
+```
+
+```sh
 npm run build
 ```
 
-`npm run collect` lit le groupe Zotero `6584095`, cible la collection `Mémoires 2026-27`, enrichit les références avec des couvertures et quelques captures de pages publiques, puis écrit `public/data/catalog.json` et les images dans `public/media/`.
-
-Pour une collecte rapide sans captures Playwright :
+## Collecte Zotero
 
 ```sh
-npm run collect:fast
+npm run collect
 ```
 
-## Cles API optionnelles
+La collecte cible le groupe `6584095` et la collection `Mémoires 2026-27`. Elle génère `public/data/catalog.json` et les médias associés dans `public/media/`.
 
-Open Library ne demande pas de cle API pour les couvertures. Les requetes sont publiques, mais limitees en debit.
+Les clés optionnelles se configurent dans un fichier local `.env.local` :
 
-Pour ameliorer la recherche de covers, creer un fichier local non versionne :
-
-```sh
-cp .env.example .env.local
+```env
+GOOGLE_BOOKS_API_KEY=
+ISBNDB_API_KEY=
 ```
 
-Puis renseigner au besoin :
+## Déploiement
 
-```sh
-GOOGLE_BOOKS_API_KEY=...
-ISBNDB_API_KEY=...
-```
+GitHub Actions collecte les données, construit l’application et la publie sur GitHub Pages à chaque push sur `main` et une fois par jour.
 
-Le collecteur lit automatiquement `.env.local`, puis `.env`, sans remplacer les variables deja definies par le shell ou GitHub Actions.
-
-Sur GitHub Pages, declarer les memes noms dans `Settings > Secrets and variables > Actions`, puis les exposer au job de collecte si necessaire.
-
-Le pipeline de covers reste entierement automatique et compatible GitHub Pages :
-
-- ISBN exact et editions proches via Open Library / Internet Archive ;
-- recherche Google Books scoree par ISBN, titre, auteur, editeur et annee quand `GOOGLE_BOOKS_API_KEY` est disponible ;
-- extraction prudente des images declarees par les pages sources (`schema.org`, Open Graph, `image_src`) pour les livres, memoires et theses ;
-- fallback ISBNdb si `ISBNDB_API_KEY` est disponible ;
-- aucune requete API au chargement du site public.
-
-Goodreads n'est pas utilise comme source automatique : son API publique historique n'est plus disponible pour de nouvelles integrations et le scraping de pages Goodreads serait fragile pour GitHub Actions.
-
-## Données
-
-Le site de production ne contacte pas Zotero au chargement. Il lit uniquement les fichiers statiques générés dans `public/`, ce qui permet une publication GitHub Pages et une mise à jour par cron.
+Les clés API de production sont enregistrées dans les secrets GitHub Actions.
