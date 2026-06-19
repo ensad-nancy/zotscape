@@ -6,6 +6,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, '..');
 const publicRoot = path.join(projectRoot, 'public');
 const dataDir = path.join(publicRoot, 'data');
+const catalogsDir = path.join(dataDir, 'catalogs');
 const mediaDir = path.join(publicRoot, 'media');
 const coverDir = path.join(mediaDir, 'covers');
 const previewDir = path.join(mediaDir, 'previews');
@@ -41,7 +42,7 @@ async function loadLocalEnvFiles() {
 await loadLocalEnvFiles();
 
 const GROUP_ID = Number(process.env.ZOTSCAPE_ZOTERO_GROUP_ID || 6584095);
-const ROOT_COLLECTION_NAME = process.env.ZOTSCAPE_ROOT_COLLECTION || 'Mémoires 2026-27';
+const ROOT_COLLECTION_FILTER = process.env.ZOTSCAPE_ROOT_COLLECTION || '';
 const API_BASE = 'https://api.zotero.org';
 const PAGE_SIZE = 100;
 const SCREENSHOT_LIMIT = Math.max(0, Number(process.env.ZOTSCAPE_SCREENSHOT_LIMIT || 18));
@@ -71,6 +72,16 @@ const WEB_CAPTURE_TYPES = new Set([
   'presentation',
 ]);
 const COVER_OBJECT_TYPES = new Set(['book', 'bookSection', 'thesis']);
+const CATALOG_ENRICHMENT_FIELDS = [
+  'cover',
+  'fallback',
+  'embed',
+  'openGraph',
+  'archive',
+  'screenshot',
+  'asset',
+  'previewStatus',
+];
 
 const TYPE_LABELS = {
   artwork: 'Oeuvre',
@@ -268,6 +279,24 @@ function slugify(value) {
     .replace(/[^a-z0-9]+/gu, '-')
     .replace(/^-+|-+$/gu, '')
     .slice(0, 80) || 'item';
+}
+
+function memoirYearCollection(name) {
+  const label = normalizeSpace(name);
+  const match = label.match(/^m[ée]moires\s+(\d{4})\s*[-–]\s*(\d{2}|\d{4})$/iu);
+  if (!match) return null;
+  const startYear = Number(match[1]);
+  const rawEnd = Number(match[2]);
+  const endYear = match[2].length === 2
+    ? Math.floor(startYear / 100) * 100 + rawEnd
+    : rawEnd;
+  if (!Number.isFinite(startYear) || !Number.isFinite(endYear) || endYear < startYear) return null;
+  return {
+    id: `${startYear}-${String(endYear).slice(-2)}`,
+    label,
+    startYear,
+    endYear,
+  };
 }
 
 function escapeXml(value) {
@@ -1699,9 +1728,92 @@ function computeAtlasLayout(references, memoirs) {
   };
 }
 
+function yearDescriptor(rootCollection, year, activeCollections, items, sharedContext) {
+  const memoirs = activeCollections
+    .filter((collection) => (collection.data?.parentCollection || false) === rootCollection.key)
+    .filter((collection) => isMemoirCollectionName(collection.data?.name))
+    .sort((left, right) => String(left.data?.name || '').localeCompare(String(right.data?.name || ''), 'fr'))
+    .map((collection) => ({
+      key: collection.key,
+      name: normalizeSpace(collection.data?.name || collection.key),
+      slug: slugify(collection.data?.name || collection.key),
+      zoteroUrl: collection.links?.alternate?.href || '',
+    }));
+  const memoirByKey = new Map(memoirs.map((memoir) => [memoir.key, memoir]));
+  const selectedTopItems = items.filter((item) => (
+    item?.key
+    && !EXCLUDED_ITEM_TYPES.has(item.data?.itemType)
+    && (item.data?.collections || []).some((key) => memoirByKey.has(key))
+  ));
+  const context = { ...sharedContext, memoirByKey };
+  const references = selectedTopItems
+    .map((item) => normalizeReference(item, context))
+    .sort((left, right) => (
+      left.title.localeCompare(right.title, 'fr')
+      || left.key.localeCompare(right.key)
+    ));
+  return {
+    year,
+    rootCollection,
+    memoirs,
+    selectedTopItems,
+    references,
+  };
+}
+
+function copyReferenceEnrichments(target, source) {
+  for (const field of CATALOG_ENRICHMENT_FIELDS) target[field] = source[field] ?? null;
+}
+
+function createYearCatalog(descriptor, metadata) {
+  const { references, memoirs, rootCollection, selectedTopItems, year } = descriptor;
+  const memoirsWithStats = memoirs.map((memoir) => computeMemoirStats(memoir, references));
+  const sharedReferences = references
+    .filter((reference) => reference.memoirKeys.length > 1)
+    .sort((left, right) => (
+      right.memoirKeys.length - left.memoirKeys.length
+      || left.title.localeCompare(right.title, 'fr')
+    ))
+    .map((reference) => ({
+      key: reference.key,
+      title: reference.title,
+      creatorsLabel: reference.creatorsLabel,
+      year: reference.year,
+      memoirKeys: reference.memoirKeys,
+      memoirNames: reference.memoirNames,
+      count: reference.memoirKeys.length,
+    }));
+  return {
+    generatedAt: metadata.generatedAt,
+    source: {
+      groupId: GROUP_ID,
+      groupName: selectedTopItems[0]?.library?.name || metadata.groupName,
+      groupUrl: selectedTopItems[0]?.library?.links?.alternate?.href || metadata.groupUrl,
+      rootCollectionKey: rootCollection.key,
+      rootCollectionName: year.label,
+      rootCollectionUrl: rootCollection.links?.alternate?.href || '',
+      libraryVersion: metadata.libraryVersion,
+      yearId: year.id,
+    },
+    stats: {
+      memoirCount: memoirsWithStats.length,
+      referenceCount: references.length,
+      sharedReferenceCount: sharedReferences.length,
+      annotationCount: references.reduce((sum, reference) => sum + reference.annotations.count, 0),
+      noteCount: references.reduce((sum, reference) => sum + reference.notes.length, 0),
+      attachmentCount: references.reduce((sum, reference) => sum + reference.attachments.count, 0),
+    },
+    layout: computeAtlasLayout(references, memoirs),
+    memoirs: memoirsWithStats,
+    references,
+    sharedReferences,
+  };
+}
+
 async function main() {
   await Promise.all([
     fs.mkdir(dataDir, { recursive: true }),
+    fs.mkdir(catalogsDir, { recursive: true }),
     fs.mkdir(coverDir, { recursive: true }),
     fs.mkdir(previewDir, { recursive: true }),
     fs.mkdir(screenshotDir, { recursive: true }),
@@ -1734,31 +1846,22 @@ async function main() {
   ]);
 
   const activeCollections = collections.filter((collection) => !collection.data?.deleted);
-  const rootCollection = activeCollections.find((collection) => (
-    collection.data?.name === ROOT_COLLECTION_NAME
-    && (collection.data?.parentCollection || false) === false
-  ));
-  if (!rootCollection) {
-    throw new Error(`Collection root not found: ${ROOT_COLLECTION_NAME}`);
+  const yearRoots = activeCollections
+    .filter((collection) => (collection.data?.parentCollection || false) === false)
+    .map((rootCollection) => ({
+      rootCollection,
+      year: memoirYearCollection(rootCollection.data?.name),
+    }))
+    .filter(({ rootCollection, year }) => (
+      year
+      && (!ROOT_COLLECTION_FILTER || rootCollection.data?.name === ROOT_COLLECTION_FILTER)
+    ))
+    .sort((left, right) => right.year.startYear - left.year.startYear);
+  if (!yearRoots.length) {
+    const suffix = ROOT_COLLECTION_FILTER ? ` matching ${ROOT_COLLECTION_FILTER}` : '';
+    throw new Error(`No root collection named Mémoires YYYY-YY${suffix}`);
   }
 
-  const memoirs = activeCollections
-    .filter((collection) => (collection.data?.parentCollection || false) === rootCollection.key)
-    .filter((collection) => isMemoirCollectionName(collection.data?.name))
-    .sort((left, right) => String(left.data?.name || '').localeCompare(String(right.data?.name || ''), 'fr'))
-    .map((collection) => ({
-      key: collection.key,
-      name: normalizeSpace(collection.data?.name || collection.key),
-      slug: slugify(collection.data?.name || collection.key),
-      zoteroUrl: collection.links?.alternate?.href || '',
-    }));
-
-  const memoirByKey = new Map(memoirs.map((memoir) => [memoir.key, memoir]));
-  const selectedTopItems = items.filter((item) => (
-    item?.key
-    && !EXCLUDED_ITEM_TYPES.has(item.data?.itemType)
-    && (item.data?.collections || []).some((key) => memoirByKey.has(key))
-  ));
   const attachmentsByParent = new Map();
   const notesByParent = new Map();
   const annotationsByAttachment = new Map();
@@ -1779,16 +1882,20 @@ async function main() {
       annotationsByAttachment.set(item.data.parentItem, list);
     }
   }
+  const sharedContext = { attachmentsByParent, notesByParent, annotationsByAttachment };
+  const descriptors = yearRoots.map(({ rootCollection, year }) => (
+    yearDescriptor(rootCollection, year, activeCollections, items, sharedContext)
+  ));
+  const uniqueReferenceByKey = new Map();
+  for (const descriptor of descriptors) {
+    for (const reference of descriptor.references) {
+      if (!uniqueReferenceByKey.has(reference.key)) uniqueReferenceByKey.set(reference.key, reference);
+    }
+    log(`Found ${descriptor.memoirs.length} memoir collections and ${descriptor.references.length} references for ${descriptor.year.id}.`);
+  }
+  const references = [...uniqueReferenceByKey.values()];
 
-  const context = { memoirByKey, attachmentsByParent, notesByParent, annotationsByAttachment };
-  const references = selectedTopItems
-    .map((item) => normalizeReference(item, context))
-    .sort((left, right) => (
-      left.title.localeCompare(right.title, 'fr')
-      || left.key.localeCompare(right.key)
-    ));
-
-  log(`Found ${memoirs.length} memoir collections and ${references.length} references.`);
+  log(`Enriching ${references.length} unique references across ${descriptors.length} year catalog(s).`);
   log('Enriching covers, embeds, page metadata and fallback cards...');
   for (const reference of references) {
     reference.cover = await enrichCover(reference, assetCache);
@@ -1860,52 +1967,62 @@ async function main() {
     };
   }
 
-  const atlasLayout = computeAtlasLayout(references, memoirs);
-  const memoirsWithStats = memoirs.map((memoir) => computeMemoirStats(memoir, references));
-  const sharedReferences = references
-    .filter((reference) => reference.memoirKeys.length > 1)
-    .sort((left, right) => (
-      right.memoirKeys.length - left.memoirKeys.length
-      || left.title.localeCompare(right.title, 'fr')
-    ))
-    .map((reference) => ({
-      key: reference.key,
-      title: reference.title,
-      creatorsLabel: reference.creatorsLabel,
-      year: reference.year,
-      memoirKeys: reference.memoirKeys,
-      memoirNames: reference.memoirNames,
-      count: reference.memoirKeys.length,
-    }));
+  for (const descriptor of descriptors) {
+    for (const reference of descriptor.references) {
+      copyReferenceEnrichments(reference, uniqueReferenceByKey.get(reference.key));
+    }
+  }
 
-  const catalog = {
-    generatedAt: new Date().toISOString(),
-    source: {
-      groupId: GROUP_ID,
-      groupName: selectedTopItems[0]?.library?.name || 'EnsadNancy',
-      groupUrl: selectedTopItems[0]?.library?.links?.alternate?.href || `https://www.zotero.org/groups/${GROUP_ID}`,
-      rootCollectionKey: rootCollection.key,
-      rootCollectionName: ROOT_COLLECTION_NAME,
-      rootCollectionUrl: rootCollection.links?.alternate?.href || '',
-      libraryVersion: Number(itemVersion || collectionVersion || 0) || null,
+  const generatedAt = new Date().toISOString();
+  const libraryVersion = Number(itemVersion || collectionVersion || 0) || null;
+  const allSelectedItems = descriptors.flatMap((descriptor) => descriptor.selectedTopItems);
+  const groupName = allSelectedItems[0]?.library?.name || 'EnsadNancy';
+  const groupUrl = allSelectedItems[0]?.library?.links?.alternate?.href || `https://www.zotero.org/groups/${GROUP_ID}`;
+  const catalogs = descriptors.map((descriptor) => ({
+    descriptor,
+    catalog: createYearCatalog(descriptor, {
+      generatedAt,
+      groupName,
+      groupUrl,
+      libraryVersion,
+    }),
+  }));
+  const referenceYears = {};
+  for (const { descriptor, catalog } of catalogs) {
+    const catalogPath = path.join(catalogsDir, `${descriptor.year.id}.json`);
+    await writeJson(catalogPath, catalog);
+    for (const reference of catalog.references) {
+      referenceYears[reference.key] ||= [];
+      referenceYears[reference.key].push(descriptor.year.id);
+    }
+    log(`Wrote ${path.relative(projectRoot, catalogPath)}.`);
+  }
+
+  const defaultCatalog = catalogs[0].catalog;
+  const catalogIndex = {
+    generatedAt,
+    defaultYear: catalogs[0].descriptor.year.id,
+    group: {
+      id: GROUP_ID,
+      name: groupName,
+      url: groupUrl,
+      libraryVersion,
     },
-    stats: {
-      memoirCount: memoirsWithStats.length,
-      referenceCount: references.length,
-      sharedReferenceCount: sharedReferences.length,
-      annotationCount: references.reduce((sum, reference) => sum + reference.annotations.count, 0),
-      noteCount: references.reduce((sum, reference) => sum + reference.notes.length, 0),
-      attachmentCount: references.reduce((sum, reference) => sum + reference.attachments.count, 0),
-    },
-    layout: atlasLayout,
-    memoirs: memoirsWithStats,
-    references,
-    sharedReferences,
+    years: catalogs.map(({ descriptor, catalog }) => ({
+      id: descriptor.year.id,
+      label: descriptor.year.label,
+      catalog: `data/catalogs/${descriptor.year.id}.json`,
+      rootCollectionUrl: catalog.source.rootCollectionUrl,
+      stats: catalog.stats,
+      generatedAt: catalog.generatedAt,
+    })),
+    referenceYears,
   };
 
-  await writeJson(path.join(dataDir, 'catalog.json'), catalog);
+  await writeJson(path.join(dataDir, 'catalog-index.json'), catalogIndex);
+  await writeJson(path.join(dataDir, 'catalog.json'), defaultCatalog);
   await writeJson(assetCacheFile, assetCache);
-  log(`Wrote ${path.relative(projectRoot, path.join(dataDir, 'catalog.json'))}.`);
+  log(`Wrote ${path.relative(projectRoot, path.join(dataDir, 'catalog-index.json'))} and latest catalog alias.`);
 }
 
 main().catch((error) => {

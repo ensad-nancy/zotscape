@@ -22,7 +22,7 @@ npm run build
 npm run collect
 ```
 
-La collecte cible le groupe `6584095` et la collection `Mémoires 2026-27`. Elle génère `public/data/catalog.json` et les médias associés dans `public/media/`.
+La collecte cible le groupe `6584095` et détecte automatiquement les collections racines nommées `Mémoires YYYY-YY`. Elle génère un catalogue par promotion, un index des archives et l’alias courant `public/data/catalog.json`. Les médias associés sont écrits dans `public/media/`.
 
 Les clés optionnelles se configurent dans un fichier local `.env.local` :
 
@@ -33,6 +33,6 @@ ISBNDB_API_KEY=
 
 ## Déploiement
 
-GitHub Actions collecte les données, construit l’application et la publie sur GitHub Pages à chaque push sur `main` et une fois par jour.
+GitHub Actions collecte les données, restaure le cache des enrichissements, construit l’application et la publie sur GitHub Pages à chaque push sur `main` et une fois par jour.
 
 Les clés API de production sont enregistrées dans les secrets GitHub Actions.

@@ -139,6 +139,70 @@ p {
   font-weight: 950;
 }
 
+.year-selector {
+  position: relative;
+  width: fit-content;
+  max-width: 100%;
+}
+
+.year-selector h1 button {
+  display: inline-flex;
+  max-width: 100%;
+  align-items: center;
+  gap: 5px;
+  padding: 0;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+  line-height: inherit;
+}
+
+.year-selector h1 button span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.year-selector-menu {
+  position: absolute;
+  top: calc(100% + 10px);
+  left: 0;
+  z-index: 50;
+  display: grid;
+  width: 230px;
+  padding: 5px;
+  background: rgba(251, 251, 245, 0.98);
+  border-radius: 6px;
+  box-shadow: 0 16px 42px rgba(17, 18, 15, 0.14);
+}
+
+.year-selector-menu button {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 10px;
+  color: var(--ink);
+  background: transparent;
+  border: 0;
+  border-radius: 3px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.year-selector-menu button:hover,
+.year-selector-menu button[aria-checked="true"] {
+  background: var(--highlight);
+}
+
+.year-selector-menu small {
+  color: var(--muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
 .atlas-title p {
   color: var(--muted);
   font-size: 11px;
@@ -150,6 +214,23 @@ p {
   flex: 0 0 auto;
   align-items: center;
   gap: 8px;
+}
+
+.header-icon-action {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  padding: 0;
+  color: var(--ink);
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.header-icon-action:hover {
+  background: color-mix(in srgb, var(--line) 56%, transparent);
 }
 
 .view-switcher {
@@ -222,6 +303,8 @@ p {
 
 .tools-toggle:focus-visible,
 .icon-button:focus-visible,
+.header-icon-action:focus-visible,
+.year-selector button:focus-visible,
 .view-switcher button:focus-visible,
 .atlas-object-main:focus-visible,
 .reference-list-row:focus-visible,
@@ -277,6 +360,8 @@ p {
 
 .mini-map-board:focus-visible,
 .mini-map-recenter:focus-visible,
+.atlas-meeting-label:focus-visible,
+.list-discover:focus-visible,
 .memoir-filter button:focus-visible,
 .detail-suggestions button:focus-visible {
   outline: 3px solid rgba(48, 79, 215, 0.28);
@@ -359,6 +444,36 @@ p {
   pointer-events: none;
 }
 
+.atlas-meeting-label {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 8;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 7px;
+  color: var(--ink);
+  background: #bde7d8;
+  border: 0;
+  border-radius: 2px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 900;
+  line-height: 1;
+}
+
+.atlas-meeting-label span {
+  display: grid;
+  min-width: 17px;
+  height: 17px;
+  place-items: center;
+  padding: 0 4px;
+  background: rgba(255, 255, 255, 0.58);
+  border-radius: 50%;
+  font-size: 9px;
+}
+
 .atlas-object {
   position: absolute;
   top: 0;
@@ -372,6 +487,16 @@ p {
 
 .atlas-object.is-related {
   filter: saturate(1.18) contrast(1.02);
+}
+
+.atlas-object.is-shared .object-caption p::after {
+  content: "";
+  display: inline-block;
+  width: 18px;
+  height: 7px;
+  margin-left: 6px;
+  background: #8dd1b9;
+  transform: rotate(-2deg);
 }
 
 .atlas-object.is-active {
@@ -964,6 +1089,27 @@ p {
   text-transform: uppercase;
 }
 
+.reference-list-commands {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.list-discover {
+  display: inline-flex;
+  height: 36px;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px;
+  color: var(--ink);
+  background: var(--highlight);
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 900;
+}
+
 .reference-list-toolbar select {
   min-width: 160px;
   height: 36px;
@@ -1145,7 +1291,8 @@ p {
 }
 
 .tool-panel,
-.detail-panel {
+.detail-panel,
+.about-panel {
   position: fixed;
   top: var(--header-height);
   right: 0;
@@ -1160,6 +1307,100 @@ p {
 .detail-panel {
   z-index: 22;
   width: min(420px, 100vw);
+}
+
+.about-panel {
+  z-index: 32;
+  display: grid;
+  align-content: start;
+  gap: 24px;
+  padding: 18px 22px 32px;
+  transform: translateX(105%);
+  transition: transform 180ms ease;
+}
+
+.about-panel[aria-hidden="true"] {
+  pointer-events: none;
+}
+
+.about-panel.is-open {
+  transform: translateX(0);
+}
+
+.about-scrim {
+  z-index: 31;
+}
+
+.about-intro {
+  display: grid;
+  gap: 18px;
+  font-size: 19px;
+  font-weight: 750;
+  line-height: 1.28;
+}
+
+.about-intro p:first-child {
+  font-size: 26px;
+  font-weight: 900;
+  line-height: 1.06;
+}
+
+.about-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  margin: 0;
+  background: var(--line);
+}
+
+.about-stats div {
+  display: grid;
+  gap: 5px;
+  padding: 12px;
+  background: var(--paper);
+}
+
+.about-stats dt,
+.about-updated {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.about-stats dd {
+  margin: 0;
+  font-size: 25px;
+  font-weight: 950;
+}
+
+.about-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.about-links a,
+.about-mobile-button {
+  display: inline-flex;
+  min-height: 38px;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px;
+  color: var(--ink);
+  background: color-mix(in srgb, var(--highlight) 64%, transparent);
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 900;
+  text-decoration: none;
+}
+
+.about-mobile-button {
+  display: none;
+  justify-content: center;
+  margin-top: 4px;
 }
 
 .tool-panel {
@@ -1202,7 +1443,8 @@ p {
   gap: 7px;
 }
 
-.tool-field span {
+.tool-field > span,
+.tool-field > label {
   display: inline-flex;
   align-items: center;
   gap: 7px;
@@ -1226,6 +1468,33 @@ p {
 
 .tool-field input::placeholder {
   color: #8c9189;
+}
+
+.tool-field .search-control {
+  position: relative;
+  display: block;
+  color: inherit;
+  text-transform: none;
+}
+
+.search-control input {
+  padding-right: 42px;
+}
+
+.search-control button {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  display: grid;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  padding: 0;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-radius: 3px;
+  cursor: pointer;
 }
 
 .memoir-filter {
@@ -1830,6 +2099,10 @@ p {
     font-size: 20px;
   }
 
+  .year-selector-menu {
+    width: 210px;
+  }
+
   .atlas-title p {
     max-width: 205px;
     font-size: 9px;
@@ -1838,6 +2111,15 @@ p {
 
   .atlas-actions {
     gap: 4px;
+  }
+
+  .about-desktop-button {
+    display: none;
+  }
+
+  .header-icon-action {
+    width: 34px;
+    height: 36px;
   }
 
   .view-switcher {
@@ -1899,6 +2181,20 @@ p {
   }
 
   .reference-list-toolbar label > span {
+    display: none;
+  }
+
+  .reference-list-commands {
+    gap: 5px;
+  }
+
+  .list-discover {
+    width: 34px;
+    padding: 0;
+    justify-content: center;
+  }
+
+  .list-discover span {
     display: none;
   }
 
@@ -1968,9 +2264,14 @@ p {
   }
 
   .tool-panel,
-  .detail-panel {
+  .detail-panel,
+  .about-panel {
     width: 100vw;
     border-left: 0;
+  }
+
+  .about-mobile-button {
+    display: inline-flex;
   }
 
   .detail-body h2 {

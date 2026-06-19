@@ -1,16 +1,19 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { TransformComponent, TransformWrapper } from 'react-zoom-pan-pinch';
 import {
   ArrowUpRight,
   BookOpen,
+  ChevronDown,
   Globe2,
   Highlighter,
+  Info,
   LayoutGrid,
   Library,
   List,
   LocateFixed,
   RotateCcw,
   Search,
+  Shuffle,
   SlidersHorizontal,
   UsersRound,
   X,
@@ -22,6 +25,7 @@ const RECENT_REFERENCE_COUNT = 6;
 const VIEW_MODES = new Set(['atlas', 'list']);
 const LIST_SORTS = new Set(['recent', 'title', 'author', 'year']);
 const REFERENCE_KEY_PATTERN = /--([a-z0-9]{8})$/iu;
+const catalogCache = new Map();
 
 const FALLBACK_PALETTES = [
   ['#f3d2c1', '#18212f', '#c4533d'],
@@ -67,10 +71,11 @@ function readViewParams() {
   return {
     view: VIEW_MODES.has(view) ? view : 'atlas',
     sort: LIST_SORTS.has(sort) ? sort : 'recent',
+    year: params.get('year') || '',
   };
 }
 
-function writeViewParams(view, sort, historyMode = 'replace') {
+function writeViewParams(view, sort, year, defaultYear, historyMode = 'replace') {
   const url = new URL(window.location.href);
   if (view === 'list') {
     url.searchParams.set('view', 'list');
@@ -80,6 +85,8 @@ function writeViewParams(view, sort, historyMode = 'replace') {
     url.searchParams.delete('view');
     url.searchParams.delete('sort');
   }
+  if (year && (year !== defaultYear || url.hash)) url.searchParams.set('year', year);
+  else url.searchParams.delete('year');
   window.history[historyMode === 'push' ? 'pushState' : 'replaceState'](
     { ...(window.history.state || {}) },
     '',
@@ -110,9 +117,12 @@ function referenceKeyFromHash(hash = window.location.hash) {
   return decoded.match(REFERENCE_KEY_PATTERN)?.[1]?.toUpperCase() || '';
 }
 
-function writeReferenceHash(reference, historyMode = 'replace', detailEntry = false) {
+function writeReferenceHash(reference, year, defaultYear, historyMode = 'replace', detailEntry = false) {
   const url = new URL(window.location.href);
   url.hash = reference ? referenceHash(reference) : '';
+  if (reference && year) url.searchParams.set('year', year);
+  else if (year && year !== defaultYear) url.searchParams.set('year', year);
+  else url.searchParams.delete('year');
   window.history[historyMode === 'push' ? 'pushState' : 'replaceState'](
     {
       ...(window.history.state || {}),
@@ -365,7 +375,7 @@ function sourceActionLabel(reference) {
   return 'Consulter la ressource';
 }
 
-function packReferences(references, viewport, recentKeys) {
+function packReferences(references, viewport, recentKeys, sharedKeys, sharedOnly) {
   const compact = viewport.width < 760;
   const margin = compact ? 64 : 104;
   const tableWidth = clamp(
@@ -389,10 +399,13 @@ function packReferences(references, viewport, recentKeys) {
     if (recentDifference) return recentDifference;
     return sortByRecent(left, right);
   });
+  if (!orderedReferences.length) {
+    return { items: [], layout: { width: tableWidth, height: viewport.height + 320 } };
+  }
   const visibleRecent = orderedReferences.filter((reference) => recentKeys.has(reference.key));
-  const featuredReferences = visibleRecent.length
-    ? visibleRecent
-    : orderedReferences.slice(0, RECENT_REFERENCE_COUNT);
+  const featuredReferences = sharedOnly
+    ? orderedReferences
+    : (visibleRecent.length ? visibleRecent : orderedReferences.slice(0, RECENT_REFERENCE_COUNT));
   const featuredKeys = new Set(featuredReferences.map((reference) => reference.key));
   const layoutsByKey = new Map();
   const collides = (layout) => placedLayouts.some((placed) => (
@@ -435,7 +448,45 @@ function packReferences(references, viewport, recentKeys) {
     featuredY += rowHeight + verticalGap;
   }
 
-  const regularReferences = orderedReferences.filter((reference) => !featuredKeys.has(reference.key));
+  const meetingReferences = sharedOnly ? [] : orderedReferences.filter((reference) => (
+    sharedKeys.has(reference.key) && !featuredKeys.has(reference.key)
+  ));
+  const meetingKeys = new Set(meetingReferences.map((reference) => reference.key));
+  const meetingColumns = Math.min(3, Math.max(1, meetingReferences.length));
+  let meetingY = featuredY + (meetingReferences.length ? (compact ? 160 : 210) : 0);
+  for (let rowStart = 0; rowStart < meetingReferences.length; rowStart += meetingColumns) {
+    const row = meetingReferences.slice(rowStart, rowStart + meetingColumns).map((reference) => ({
+      reference,
+      size: objectDimensions(reference, false),
+    }));
+    const rowWidth = row.reduce((sum, item) => sum + item.size.width, 0) + horizontalGap * (row.length - 1);
+    const rowHeight = Math.max(...row.map((item) => item.size.height));
+    let meetingX = Math.round((tableWidth - rowWidth) / 2);
+    row.forEach(({ reference, size }, rowIndex) => {
+      const seed = hashValue(`meeting:${reference.key}:${rowStart + rowIndex}`);
+      const layout = {
+        index: featuredReferences.length + rowStart + rowIndex + 1,
+        x: meetingX,
+        y: meetingY + Math.round((((seed >> 8) % 100) / 100 - 0.5) * 34),
+        width: size.width,
+        height: size.height,
+        mediaHeight: size.mediaHeight,
+        captionHeight: size.captionHeight,
+        rotation: 0,
+        layer: 3,
+        featured: false,
+        meeting: true,
+      };
+      placedLayouts.push(layout);
+      layoutsByKey.set(reference.key, layout);
+      meetingX += size.width + horizontalGap;
+    });
+    meetingY += rowHeight + verticalGap;
+  }
+
+  const regularReferences = orderedReferences.filter((reference) => (
+    !featuredKeys.has(reference.key) && !meetingKeys.has(reference.key)
+  ));
   regularReferences.forEach((reference, index) => {
     const size = objectDimensions(reference, false);
     const seed = hashValue(`${reference.key}:${index}`);
@@ -445,7 +496,7 @@ function packReferences(references, viewport, recentKeys) {
     const jitterY = Math.round(((((seed >> 8) % 100) / 100) - 0.5) * (compact ? 48 : 76));
     const panelOffset = panel * tableBaseHeight;
     const layout = {
-      index: featuredReferences.length + index + 1,
+      index: featuredReferences.length + meetingReferences.length + index + 1,
       x: clamp(
         Math.round(margin + anchor[0] * (tableWidth - margin * 2 - size.width) + jitterX),
         margin,
@@ -576,6 +627,56 @@ function ViewSwitcher({ value, onChange }) {
   );
 }
 
+function YearSelector({ activeYear, years, onChange }) {
+  const [open, setOpen] = useState(false);
+  const selectorRef = useRef(null);
+  const current = years.find((year) => year.id === activeYear) || years[0];
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const close = (event) => {
+      if (event.key === 'Escape' || !selectorRef.current?.contains(event.target)) setOpen(false);
+    };
+    window.addEventListener('keydown', close);
+    window.addEventListener('pointerdown', close);
+    return () => {
+      window.removeEventListener('keydown', close);
+      window.removeEventListener('pointerdown', close);
+    };
+  }, [open]);
+
+  if (years.length < 2) return <h1>{current?.label || `Mémoires ${activeYear}`}</h1>;
+  return (
+    <div className="year-selector" ref={selectorRef}>
+      <h1>
+        <button type="button" onClick={() => setOpen((value) => !value)} aria-expanded={open}>
+          <span>{current?.label || `Mémoires ${activeYear}`}</span>
+          <ChevronDown size={17} aria-hidden="true" />
+        </button>
+      </h1>
+      {open && (
+        <div className="year-selector-menu" role="menu">
+          {years.map((year) => (
+            <button
+              type="button"
+              role="menuitemradio"
+              aria-checked={year.id === activeYear}
+              key={year.id}
+              onClick={() => {
+                setOpen(false);
+                onChange(year.id);
+              }}
+            >
+              <span>{year.label}</span>
+              <small>{year.stats?.referenceCount || 0} références</small>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ListVisual({ reference }) {
   if (reference.asset?.kind === 'fallback') {
     return (
@@ -599,7 +700,7 @@ function ReferenceListRow({ reference, active, onSelect }) {
     noteCount > 0 ? `${noteCount} note${noteCount > 1 ? 's' : ''}` : '',
   ].filter(Boolean);
   return (
-    <li className={`reference-list-item${active ? ' is-active' : ''}`}>
+    <li id={`reference-${reference.key}`} className={`reference-list-item${active ? ' is-active' : ''}`}>
       <button
         className="reference-list-row"
         type="button"
@@ -623,7 +724,7 @@ function ReferenceListRow({ reference, active, onSelect }) {
   );
 }
 
-function ReferenceList({ references, sort, onSortChange, recentKeys, selectedReference, onSelect }) {
+function ReferenceList({ references, sort, onSortChange, recentKeys, selectedReference, onSelect, onDiscover }) {
   const recentReferences = sort === 'recent'
     ? references.filter((reference) => recentKeys.has(reference.key))
     : [];
@@ -641,15 +742,21 @@ function ReferenceList({ references, sort, onSortChange, recentKeys, selectedRef
     <section className="reference-list-view" aria-label="Liste des références">
       <div className="reference-list-toolbar">
         <p>{references.length} référence{references.length > 1 ? 's' : ''}</p>
-        <label>
-          <span>Trier par</span>
-          <select value={sort} onChange={(event) => onSortChange(event.target.value)}>
-            <option value="recent">Ajouts récents</option>
-            <option value="title">Titre</option>
-            <option value="author">Auteur</option>
-            <option value="year">Année</option>
-          </select>
-        </label>
+        <div className="reference-list-commands">
+          <button className="list-discover" type="button" onClick={onDiscover}>
+            <Shuffle size={16} aria-hidden="true" />
+            <span>Découvrir</span>
+          </button>
+          <label>
+            <span>Trier par</span>
+            <select value={sort} onChange={(event) => onSortChange(event.target.value)}>
+              <option value="recent">Ajouts récents</option>
+              <option value="title">Titre</option>
+              <option value="author">Auteur</option>
+              <option value="year">Année</option>
+            </select>
+          </label>
+        </div>
       </div>
       {groups.map((group) => (
         <section className="reference-list-group" key={group.label || sort}>
@@ -686,9 +793,19 @@ function ToolPanel({
   allTypeOptions,
   allYearOptions,
   referenceCount,
+  searchFocusToken,
   onClose,
+  onOpenAbout,
   onReset,
 }) {
+  const searchRef = useRef(null);
+
+  useEffect(() => {
+    if (!open || !searchFocusToken) return undefined;
+    const frame = window.requestAnimationFrame(() => searchRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [open, searchFocusToken]);
+
   useEffect(() => {
     if (!open) return undefined;
     const handleKey = (event) => {
@@ -709,10 +826,17 @@ function ToolPanel({
           </button>
         </div>
 
-        <label className="tool-field tool-field--search">
-          <span><Search size={16} aria-hidden="true" />Recherche</span>
-          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Titre, auteur, sujet..." />
-        </label>
+        <div className="tool-field tool-field--search">
+          <label htmlFor="reference-search"><Search size={16} aria-hidden="true" />Recherche</label>
+          <span className="search-control">
+            <input id="reference-search" ref={searchRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Titre, auteur, sujet..." />
+            {query && (
+              <button type="button" onClick={() => setQuery('')} aria-label="Effacer la recherche">
+                <X size={16} aria-hidden="true" />
+              </button>
+            )}
+          </span>
+        </div>
 
         <fieldset className="memoir-filter">
           <legend>Mémoires</legend>
@@ -749,7 +873,7 @@ function ToolPanel({
 
         <div className="tool-cluster" aria-label="Filtres lecteurs">
           <FeatureToggle active={featureFilters.has('annotations')} icon={Highlighter} label="Avec surlignes" onClick={() => setFeatureFilters(toggleSet(featureFilters, 'annotations'))} />
-          <FeatureToggle active={featureFilters.has('shared')} icon={UsersRound} label="Références communes" onClick={() => setFeatureFilters(toggleSet(featureFilters, 'shared'))} />
+          <FeatureToggle active={featureFilters.has('shared')} icon={UsersRound} label="Points de rencontre" onClick={() => setFeatureFilters(toggleSet(featureFilters, 'shared'))} />
         </div>
 
         <details className="secondary-filters" open={Boolean(yearFilter)}>
@@ -767,19 +891,67 @@ function ToolPanel({
           <RotateCcw size={16} aria-hidden="true" />
           <span>Réinitialiser</span>
         </button>
+        <button className="about-mobile-button" type="button" onClick={onOpenAbout}>
+          <Info size={16} aria-hidden="true" />
+          <span>À propos</span>
+        </button>
       </aside>
     </>
   );
 }
 
-function AtlasObject({ reference, layout, active, related, recent, onSelect, onHover }) {
+function AboutPanel({ open, catalog, onClose }) {
+  useEffect(() => {
+    if (!open) return undefined;
+    const handleKey = (event) => {
+      if (event.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+  }, [onClose, open]);
+
+  return (
+    <>
+      <div className={`panel-scrim about-scrim${open ? ' is-open' : ''}`} role="presentation" onMouseDown={onClose} />
+      <aside id="about-panel" className={`about-panel${open ? ' is-open' : ''}`} role="dialog" aria-modal="false" aria-hidden={!open} aria-label="À propos">
+        <div className="panel-head">
+          <h2>À propos</h2>
+          <button className="icon-button" type="button" onClick={onClose} aria-label="Fermer">
+            <X size={20} />
+          </button>
+        </div>
+        <div className="about-intro">
+          <p>Cette table rassemble les livres, films, articles et sites qui accompagnent les mémoires en cours à l’Ensad Nancy.</p>
+          <p>Elle ne cherche pas à figer une bibliographie. Elle montre une collection en train de se faire : des références arrivent, circulent entre les recherches, se couvrent de notes et laissent une trace d’une promotion à l’autre.</p>
+        </div>
+        <dl className="about-stats">
+          <div><dt>Références</dt><dd>{catalog.stats.referenceCount}</dd></div>
+          <div><dt>Mémoires</dt><dd>{catalog.stats.memoirCount}</dd></div>
+          <div><dt>Points de rencontre</dt><dd>{catalog.stats.sharedReferenceCount || 0}</dd></div>
+          <div><dt>Surlignes</dt><dd>{catalog.stats.annotationCount || 0}</dd></div>
+        </dl>
+        <p className="about-updated">Mis à jour le {formatUpdated(catalog.generatedAt)}</p>
+        <div className="about-links">
+          <a href={catalog.source.groupUrl} target="_blank" rel="noreferrer">
+            <Library size={16} aria-hidden="true" /> Groupe Zotero
+          </a>
+          <a href={catalog.source.rootCollectionUrl} target="_blank" rel="noreferrer">
+            <ArrowUpRight size={16} aria-hidden="true" /> Collection Zotero
+          </a>
+        </div>
+      </aside>
+    </>
+  );
+}
+
+function AtlasObject({ reference, layout, active, related, recent, shared, onSelect, onHover }) {
   const assetKind = reference.asset?.kind || 'fallback';
   const type = supportType(reference);
   const transform = `translate(${layout.x}px, ${layout.y}px)`;
 
   return (
     <article
-      className={`atlas-object atlas-object--${assetKind} atlas-object--${type}${active ? ' is-active' : ''}${related ? ' is-related' : ''}${recent ? ' is-recent' : ''}`}
+      className={`atlas-object atlas-object--${assetKind} atlas-object--${type}${active ? ' is-active' : ''}${related ? ' is-related' : ''}${recent ? ' is-recent' : ''}${shared ? ' is-shared' : ''}`}
       style={{
         width: layout.width,
         height: layout.height,
@@ -809,7 +981,7 @@ function AtlasObject({ reference, layout, active, related, recent, onSelect, onH
   );
 }
 
-function AtlasViewport({ focalItems, viewport, scale, setTransform, children }) {
+function AtlasViewport({ focalItems, focusItem, viewport, scale, setTransform, children }) {
   const bounds = useMemo(() => itemBounds(focalItems), [focalItems]);
   const focalSignature = focalItems.map(({ reference, layout }) => (
     `${reference.key}:${layout.x}:${layout.y}:${layout.width}:${layout.height}`
@@ -825,6 +997,17 @@ function AtlasViewport({ focalItems, viewport, scale, setTransform, children }) 
     return () => window.cancelAnimationFrame(frame);
   }, [focalSignature, scale, target?.x, target?.y]);
 
+  useEffect(() => {
+    if (!focusItem) return undefined;
+    const point = {
+      x: focusItem.layout.x + focusItem.layout.width / 2,
+      y: focusItem.layout.y + focusItem.layout.height / 2,
+    };
+    const next = transformForPoint(point, viewport, scale);
+    const frame = window.requestAnimationFrame(() => setTransform(next.x, next.y, scale, 260, 'easeOut'));
+    return () => window.cancelAnimationFrame(frame);
+  }, [focusItem?.reference.key, scale, setTransform, viewport]);
+
   const recenter = () => {
     if (target) setTransform(target.x, target.y, scale, 260, 'easeOut');
   };
@@ -836,7 +1019,7 @@ function AtlasViewport({ focalItems, viewport, scale, setTransform, children }) 
   return children({ navigate, recenter });
 }
 
-function MiniMap({ items, layout, activeKey, transformState, viewport, onNavigate, onRecenter }) {
+function MiniMap({ items, layout, activeKey, transformState, viewport, onNavigate, onRecenter, onDiscover }) {
   const compact = viewport.width < 760;
   const width = compact ? 96 : 150;
   const height = compact ? 68 : 105;
@@ -886,6 +1069,9 @@ function MiniMap({ items, layout, activeKey, transformState, viewport, onNavigat
       </button>
       <button className="mini-map-recenter" type="button" onClick={onRecenter} aria-label="Recentrer sur les derniers ajouts" title="Recentrer">
         <LocateFixed size={16} aria-hidden="true" />
+      </button>
+      <button className="mini-map-recenter" type="button" onClick={onDiscover} aria-label="Découvrir une référence" title="Découvrir">
+        <Shuffle size={16} aria-hidden="true" />
       </button>
     </aside>
   );
@@ -1040,8 +1226,48 @@ function EmptyState() {
   );
 }
 
+async function loadCatalogForYear(index, yearId) {
+  const entry = index.years.find((year) => year.id === yearId);
+  if (!entry) throw new Error(`Promotion inconnue : ${yearId}`);
+  const cacheKey = entry.catalog;
+  if (catalogCache.has(cacheKey)) return catalogCache.get(cacheKey);
+  const response = await fetch(assetUrl(entry.catalog));
+  if (!response.ok) throw new Error(`${entry.catalog} ${response.status}`);
+  const payload = await response.json();
+  catalogCache.set(cacheKey, payload);
+  return payload;
+}
+
+function legacyCatalogIndex(catalog) {
+  const yearId = catalog.source?.yearId
+    || catalog.source?.rootCollectionName?.match(/(\d{4}-\d{2,4})/u)?.[1]
+    || 'courant';
+  const entry = {
+    id: yearId,
+    label: catalog.source?.rootCollectionName || `Mémoires ${yearId}`,
+    catalog: 'data/catalog.json',
+    rootCollectionUrl: catalog.source?.rootCollectionUrl,
+    stats: catalog.stats,
+    generatedAt: catalog.generatedAt,
+  };
+  catalogCache.set(entry.catalog, catalog);
+  return {
+    generatedAt: catalog.generatedAt,
+    defaultYear: yearId,
+    group: {
+      id: catalog.source?.groupId,
+      name: catalog.source?.groupName,
+      url: catalog.source?.groupUrl,
+    },
+    years: [entry],
+    referenceYears: Object.fromEntries((catalog.references || []).map((reference) => [reference.key, [yearId]])),
+  };
+}
+
 export default function App() {
   const [catalog, setCatalog] = useState(null);
+  const [catalogIndex, setCatalogIndex] = useState(null);
+  const [activeYear, setActiveYear] = useState('');
   const [error, setError] = useState('');
   const [activeMemoir, setActiveMemoir] = useState('');
   const [query, setQuery] = useState('');
@@ -1049,26 +1275,36 @@ export default function App() {
   const [yearFilter, setYearFilter] = useState('');
   const [featureFilters, setFeatureFilters] = useState(new Set());
   const [toolsOpen, setToolsOpen] = useState(false);
+  const [aboutOpen, setAboutOpen] = useState(false);
+  const [searchFocusToken, setSearchFocusToken] = useState(0);
   const [selectedReference, setSelectedReference] = useState(null);
   const [viewMode, setViewMode] = useState(() => readViewParams().view);
   const [listSort, setListSort] = useState(() => readViewParams().sort);
   const [hoveredKey, setHoveredKey] = useState('');
+  const [focusReferenceKey, setFocusReferenceKey] = useState('');
   const [transformState, setTransformState] = useState({ scale: 1, positionX: 0, positionY: 0 });
   const [viewport, setViewport] = useState({ width: 1280, height: 720 });
+  const activeYearRef = useRef('');
 
   useEffect(() => {
     let cancelled = false;
-    fetch(`${BASE_URL}data/catalog.json`)
-      .then((response) => {
-        if (!response.ok) throw new Error(`catalog.json ${response.status}`);
-        return response.json();
-      })
-      .then((payload) => {
-        if (!cancelled) setCatalog(payload);
-      })
-      .catch((loadError) => {
+    async function loadIndex() {
+      try {
+        const response = await fetch(`${BASE_URL}data/catalog-index.json`);
+        if (response.ok) {
+          const payload = await response.json();
+          if (!cancelled) setCatalogIndex(payload);
+          return;
+        }
+        const legacyResponse = await fetch(`${BASE_URL}data/catalog.json`);
+        if (!legacyResponse.ok) throw new Error(`catalog.json ${legacyResponse.status}`);
+        const legacyCatalog = await legacyResponse.json();
+        if (!cancelled) setCatalogIndex(legacyCatalogIndex(legacyCatalog));
+      } catch (loadError) {
         if (!cancelled) setError(loadError.message || 'Chargement impossible');
-      });
+      }
+    }
+    loadIndex();
     return () => {
       cancelled = true;
     };
@@ -1081,48 +1317,78 @@ export default function App() {
     return () => window.removeEventListener('resize', updateViewport);
   }, []);
 
-  const references = catalog?.references || [];
-  const memoirs = catalog?.memoirs || [];
-
   useEffect(() => {
-    const syncLocation = () => {
-      const next = readViewParams();
-      setViewMode(next.view);
-      setListSort(next.sort);
-      setHoveredKey('');
+    if (!catalogIndex) return undefined;
+    let cancelled = false;
+    let requestId = 0;
 
+    const syncLocation = async () => {
+      const currentRequest = ++requestId;
+      const next = readViewParams();
       const key = referenceKeyFromHash();
-      if (!key) {
-        setSelectedReference(null);
-        return;
-      }
-      if (!references.length) return;
-      const reference = references.find((candidate) => candidate.key.toUpperCase() === key);
-      if (!reference) {
-        setSelectedReference(null);
-        writeReferenceHash(null, 'replace', false);
-        return;
-      }
-      setSelectedReference(reference);
-      if (window.location.hash !== referenceHash(reference)) {
-        writeReferenceHash(
-          reference,
-          'replace',
-          Boolean(window.history.state?.zotscapeDetailEntry),
-        );
+      const availableYears = new Set(catalogIndex.years.map((year) => year.id));
+      const referenceYears = key ? (catalogIndex.referenceYears?.[key] || []) : [];
+      const requestedYear = availableYears.has(next.year) ? next.year : '';
+      const targetYear = requestedYear
+        || referenceYears.find((year) => availableYears.has(year))
+        || catalogIndex.defaultYear;
+
+      try {
+        const payload = await loadCatalogForYear(catalogIndex, targetYear);
+        if (cancelled || currentRequest !== requestId) return;
+        if (activeYearRef.current && activeYearRef.current !== targetYear) resetTools();
+        activeYearRef.current = targetYear;
+        setActiveYear(targetYear);
+        setCatalog(payload);
+        setError('');
+        setToolsOpen(false);
+        setAboutOpen(false);
+        setFocusReferenceKey('');
+        setHoveredKey('');
+        setViewMode(next.view);
+        setListSort(next.sort);
+
+        const reference = key
+          ? (payload.references || []).find((candidate) => candidate.key.toUpperCase() === key)
+          : null;
+        setSelectedReference(reference || null);
+        writeViewParams(next.view, next.sort, targetYear, catalogIndex.defaultYear, 'replace');
+        if (reference) {
+          writeReferenceHash(
+            reference,
+            targetYear,
+            catalogIndex.defaultYear,
+            'replace',
+            Boolean(window.history.state?.zotscapeDetailEntry),
+          );
+        } else if (key) {
+          writeReferenceHash(null, targetYear, catalogIndex.defaultYear, 'replace', false);
+        }
+      } catch (loadError) {
+        if (!cancelled) setError(loadError.message || 'Chargement impossible');
       }
     };
 
-    const current = readViewParams();
-    writeViewParams(current.view, current.sort, 'replace');
     syncLocation();
     window.addEventListener('popstate', syncLocation);
     window.addEventListener('hashchange', syncLocation);
     return () => {
+      cancelled = true;
       window.removeEventListener('popstate', syncLocation);
       window.removeEventListener('hashchange', syncLocation);
     };
-  }, [references]);
+  }, [catalogIndex]);
+
+  const references = catalog?.references || [];
+  const memoirs = catalog?.memoirs || [];
+
+  useEffect(() => {
+    if (!catalog) return;
+    const key = referenceKeyFromHash();
+    if (!key) return;
+    const reference = references.find((candidate) => candidate.key.toUpperCase() === key);
+    if (reference) setSelectedReference(reference);
+  }, [catalog, references]);
 
   const filteredReferences = useMemo(() => {
     const search = normalize(query);
@@ -1144,13 +1410,17 @@ export default function App() {
       .slice(0, RECENT_REFERENCE_COUNT)
       .map((reference) => reference.key),
   ), [references]);
+  const sharedKeys = useMemo(() => new Set(
+    references.filter((reference) => reference.memoirKeys?.length > 1).map((reference) => reference.key),
+  ), [references]);
+  const sharedOnly = featureFilters.has('shared');
   const sortedListReferences = useMemo(
     () => sortListReferences(filteredReferences, listSort),
     [filteredReferences, listSort],
   );
   const packed = useMemo(
-    () => packReferences(filteredReferences, viewport, recentKeys),
-    [filteredReferences, recentKeys, viewport],
+    () => packReferences(filteredReferences, viewport, recentKeys, sharedKeys, sharedOnly),
+    [filteredReferences, recentKeys, sharedKeys, sharedOnly, viewport],
   );
   const visibleItems = packed.items;
   const layout = packed.layout || catalog?.layout || DEFAULT_LAYOUT;
@@ -1158,12 +1428,25 @@ export default function App() {
     () => visibleItems.filter(({ reference }) => recentKeys.has(reference.key)),
     [recentKeys, visibleItems],
   );
+  const visibleSharedItems = useMemo(
+    () => visibleItems.filter(({ reference }) => sharedKeys.has(reference.key)),
+    [sharedKeys, visibleItems],
+  );
+  const meetingItems = useMemo(
+    () => sharedOnly
+      ? visibleSharedItems
+      : visibleSharedItems.filter(({ reference }) => !recentKeys.has(reference.key)),
+    [recentKeys, sharedOnly, visibleSharedItems],
+  );
   const focalItems = useMemo(
-    () => visibleRecentItems.length ? visibleRecentItems : visibleItems.slice(0, RECENT_REFERENCE_COUNT),
-    [visibleItems, visibleRecentItems],
+    () => sharedOnly
+      ? visibleSharedItems
+      : (visibleRecentItems.length ? visibleRecentItems : visibleItems.slice(0, RECENT_REFERENCE_COUNT)),
+    [sharedOnly, visibleItems, visibleRecentItems, visibleSharedItems],
   );
   const focalBounds = useMemo(() => itemBounds(focalItems), [focalItems]);
   const recentBounds = useMemo(() => itemBounds(visibleRecentItems), [visibleRecentItems]);
+  const meetingBounds = useMemo(() => itemBounds(meetingItems), [meetingItems]);
   const fixedScale = useMemo(() => {
     const compact = viewport.width < 760;
     const preferredScale = compact ? 0.68 : 0.9;
@@ -1192,20 +1475,21 @@ export default function App() {
     [references, selectedReference],
   );
   const toolCount = activeToolCount({ activeMemoir, query, typeFilter, yearFilter, featureFilters });
+  const focusItem = useMemo(
+    () => visibleItems.find(({ reference }) => reference.key === focusReferenceKey) || null,
+    [focusReferenceKey, visibleItems],
+  );
 
   useEffect(() => {
-    setTransformState((current) => ({
-      ...current,
-      scale: fixedScale,
-    }));
+    setTransformState((current) => ({ ...current, scale: fixedScale }));
   }, [fixedScale]);
 
   useEffect(() => {
     if (selectedReference && !filteredReferences.some((reference) => reference.key === selectedReference.key)) {
       setSelectedReference(null);
-      writeReferenceHash(null, 'replace', false);
+      writeReferenceHash(null, activeYear, catalogIndex?.defaultYear, 'replace', false);
     }
-  }, [filteredReferences, selectedReference]);
+  }, [activeYear, catalogIndex?.defaultYear, filteredReferences, selectedReference]);
 
   useEffect(() => {
     if (viewMode !== 'atlas') return undefined;
@@ -1240,19 +1524,6 @@ export default function App() {
     };
   }, [fixedScale, layout.height, layout.width, viewMode, visibleItems.length]);
 
-  function changeViewMode(nextView) {
-    if (!VIEW_MODES.has(nextView) || nextView === viewMode) return;
-    setViewMode(nextView);
-    setHoveredKey('');
-    writeViewParams(nextView, listSort, selectedReference ? 'replace' : 'push');
-  }
-
-  function changeListSort(nextSort) {
-    if (!LIST_SORTS.has(nextSort) || nextSort === listSort) return;
-    setListSort(nextSort);
-    writeViewParams(viewMode, nextSort, 'replace');
-  }
-
   function resetTools() {
     setActiveMemoir('');
     setQuery('');
@@ -1261,11 +1532,49 @@ export default function App() {
     setFeatureFilters(new Set());
   }
 
+  function changeViewMode(nextView) {
+    if (!VIEW_MODES.has(nextView) || nextView === viewMode) return;
+    setViewMode(nextView);
+    setHoveredKey('');
+    writeViewParams(nextView, listSort, activeYear, catalogIndex.defaultYear, selectedReference ? 'replace' : 'push');
+  }
+
+  function changeListSort(nextSort) {
+    if (!LIST_SORTS.has(nextSort) || nextSort === listSort) return;
+    setListSort(nextSort);
+    writeViewParams(viewMode, nextSort, activeYear, catalogIndex.defaultYear, 'replace');
+  }
+
+  async function changeCatalogYear(nextYear) {
+    if (!catalogIndex || nextYear === activeYear) return;
+    try {
+      const payload = await loadCatalogForYear(catalogIndex, nextYear);
+      resetTools();
+      setCatalog(payload);
+      setActiveYear(nextYear);
+      activeYearRef.current = nextYear;
+      setSelectedReference(null);
+      setHoveredKey('');
+      setFocusReferenceKey('');
+      setToolsOpen(false);
+      setAboutOpen(false);
+      const url = new URL(window.location.href);
+      url.hash = '';
+      if (nextYear === catalogIndex.defaultYear) url.searchParams.delete('year');
+      else url.searchParams.set('year', nextYear);
+      window.history.pushState({ ...(window.history.state || {}), zotscapeDetailEntry: false }, '', url);
+    } catch (loadError) {
+      setError(loadError.message || 'Chargement impossible');
+    }
+  }
+
   function openReference(reference) {
     const replacing = Boolean(selectedReference);
     setSelectedReference(reference);
     writeReferenceHash(
       reference,
+      activeYear,
+      catalogIndex.defaultYear,
       replacing ? 'replace' : 'push',
       replacing ? Boolean(window.history.state?.zotscapeDetailEntry) : true,
     );
@@ -1278,7 +1587,40 @@ export default function App() {
       window.history.back();
       return;
     }
-    writeReferenceHash(null, 'replace', false);
+    writeReferenceHash(null, activeYear, catalogIndex.defaultYear, 'replace', false);
+  }
+
+  function openSearch() {
+    setAboutOpen(false);
+    setToolsOpen(true);
+    setSearchFocusToken((value) => value + 1);
+  }
+
+  function openAbout() {
+    setToolsOpen(false);
+    setAboutOpen(true);
+  }
+
+  function activateMeetingPoints() {
+    setFeatureFilters((current) => {
+      const next = new Set(current);
+      next.add('shared');
+      return next;
+    });
+  }
+
+  function discoverReference() {
+    const candidates = filteredReferences.filter((reference) => reference.key !== selectedReference?.key);
+    const pool = candidates.length ? candidates : filteredReferences;
+    if (!pool.length) return;
+    const reference = pool[Math.floor(Math.random() * pool.length)];
+    setFocusReferenceKey(reference.key);
+    openReference(reference);
+    if (viewMode === 'list') {
+      window.requestAnimationFrame(() => {
+        document.getElementById(`reference-${reference.key}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      });
+    }
   }
 
   if (error) {
@@ -1292,7 +1634,7 @@ export default function App() {
     );
   }
 
-  if (!catalog) {
+  if (!catalog || !catalogIndex) {
     return (
       <main className="app-shell app-shell--empty">
         <div className="empty-state">
@@ -1307,12 +1649,12 @@ export default function App() {
     <main className="app-shell">
       <header className="atlas-header">
         <div className="atlas-heading">
-          <a className="brand-link" href={catalog.source.groupUrl} target="_blank" rel="noreferrer">
+          <a className="brand-link" href={BASE_URL}>
             <Library size={17} aria-hidden="true" />
             <span>EnsadNancy</span>
           </a>
           <div className="atlas-title">
-            <h1>{catalog.source.rootCollectionName}</h1>
+            <YearSelector activeYear={activeYear} years={catalogIndex.years} onChange={changeCatalogYear} />
             <p>
               {filteredReferences.length === catalog.stats.referenceCount
                 ? `${catalog.stats.referenceCount} références`
@@ -1324,10 +1666,19 @@ export default function App() {
         </div>
         <div className="atlas-actions">
           <ViewSwitcher value={viewMode} onChange={changeViewMode} />
+          <button className="header-icon-action" type="button" onClick={openSearch} aria-label="Rechercher" title="Rechercher">
+            <Search size={18} aria-hidden="true" />
+          </button>
+          <button className="header-icon-action about-desktop-button" type="button" onClick={openAbout} aria-label="À propos" title="À propos">
+            <Info size={18} aria-hidden="true" />
+          </button>
           <button
             className="tools-toggle"
             type="button"
-            onClick={() => setToolsOpen((open) => !open)}
+            onClick={() => {
+              setAboutOpen(false);
+              setToolsOpen((open) => !open);
+            }}
             aria-label={toolsOpen ? 'Fermer les filtres' : 'Ouvrir les filtres'}
             aria-expanded={toolsOpen}
             aria-controls="filter-panel"
@@ -1343,7 +1694,7 @@ export default function App() {
       {filteredReferences.length ? (
         viewMode === 'atlas' ? (
           <TransformWrapper
-            key={`${Math.round(fixedScale * 100)}-${layout.width}-${layout.height}-${filteredReferences.map((reference) => reference.key).join('-')}`}
+            key={`${activeYear}-${Math.round(fixedScale * 100)}-${layout.width}-${layout.height}-${filteredReferences.map((reference) => reference.key).join('-')}`}
             initialScale={fixedScale}
             minScale={fixedScale}
             maxScale={fixedScale}
@@ -1354,7 +1705,7 @@ export default function App() {
             onTransformed={(_, state) => setTransformState(state)}
           >
             {({ setTransform }) => (
-              <AtlasViewport focalItems={focalItems} viewport={viewport} scale={fixedScale} setTransform={setTransform}>
+              <AtlasViewport focalItems={focalItems} focusItem={focusItem} viewport={viewport} scale={fixedScale} setTransform={setTransform}>
                 {({ navigate, recenter }) => (
                   <>
                     <MiniMap
@@ -1365,16 +1716,27 @@ export default function App() {
                       viewport={viewport}
                       onNavigate={navigate}
                       onRecenter={recenter}
+                      onDiscover={discoverReference}
                     />
                     <TransformComponent wrapperClass="atlas-wrapper" contentClass="atlas-content">
                       <section className="atlas-surface" style={{ width: layout.width, height: layout.height }} aria-label="Table de références">
-                        {recentBounds && (
+                        {!sharedOnly && recentBounds && (
                           <p
                             className="atlas-recent-label"
                             style={{ transform: `translate(${recentBounds.left}px, ${Math.max(18, recentBounds.top - 38)}px)` }}
                           >
                             Derniers ajouts
                           </p>
+                        )}
+                        {meetingBounds && (
+                          <button
+                            className="atlas-meeting-label"
+                            type="button"
+                            onClick={activateMeetingPoints}
+                            style={{ transform: `translate(${meetingBounds.left}px, ${Math.max(18, meetingBounds.top - 42)}px)` }}
+                          >
+                            Points de rencontre <span>{visibleSharedItems.length}</span>
+                          </button>
                         )}
                         {visibleItems.map(({ reference, layout: itemLayout }) => (
                           <AtlasObject
@@ -1384,6 +1746,7 @@ export default function App() {
                             active={activeReference?.key === reference.key}
                             related={relatedKeys.has(reference.key)}
                             recent={recentKeys.has(reference.key)}
+                            shared={sharedKeys.has(reference.key)}
                             onSelect={openReference}
                             onHover={setHoveredKey}
                           />
@@ -1403,6 +1766,7 @@ export default function App() {
             recentKeys={recentKeys}
             selectedReference={selectedReference}
             onSelect={openReference}
+            onDiscover={discoverReference}
           />
         )
       ) : (
@@ -1425,16 +1789,20 @@ export default function App() {
         allTypeOptions={allTypeOptions}
         allYearOptions={allYearOptions}
         referenceCount={references.length}
+        searchFocusToken={searchFocusToken}
         onClose={() => setToolsOpen(false)}
+        onOpenAbout={openAbout}
         onReset={resetTools}
       />
+
+      <AboutPanel open={aboutOpen} catalog={catalog} onClose={() => setAboutOpen(false)} />
 
       <DetailPanel
         reference={selectedReference}
         suggestions={suggestions}
         onSelect={openReference}
         onClose={closeReference}
-        suspended={toolsOpen}
+        suspended={toolsOpen || aboutOpen}
       />
     </main>
   );
