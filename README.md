@@ -24,6 +24,8 @@ npm run collect
 
 La collecte cible le groupe `6584095` et détecte automatiquement les collections racines nommées `Mémoires YYYY-YY`. Elle génère un catalogue par promotion, un index des archives et l’alias courant `public/data/catalog.json`. Les médias associés sont écrits dans `public/media/`.
 
+La récupération des couvertures utilise notamment Open Library, Google Books, la BnF et Inventaire. Lorsque seule une pièce jointe PDF publique est disponible, la collecte peut rasteriser sa première page éditoriale avec Poppler (`pdftoppm` et `pdftotext`). Ce fallback est ignoré sans faire échouer la collecte si Poppler n’est pas installé (`brew install poppler` sur macOS).
+
 Les clés optionnelles se configurent dans un fichier local `.env.local` :
 
 ```env

@@ -10,7 +10,6 @@ import {
   LayoutGrid,
   Library,
   List,
-  LocateFixed,
   RotateCcw,
   Search,
   Shuffle,
@@ -1008,18 +1007,15 @@ function AtlasViewport({ focalItems, focusItem, viewport, scale, setTransform, c
     return () => window.cancelAnimationFrame(frame);
   }, [focusItem?.reference.key, scale, setTransform, viewport]);
 
-  const recenter = () => {
-    if (target) setTransform(target.x, target.y, scale, 260, 'easeOut');
-  };
   const navigate = (x, y) => {
     const next = transformForPoint({ x, y }, viewport, scale);
     setTransform(next.x, next.y, scale, 220, 'easeOut');
   };
 
-  return children({ navigate, recenter });
+  return children({ navigate });
 }
 
-function MiniMap({ items, layout, activeKey, transformState, viewport, onNavigate, onRecenter, onDiscover }) {
+function MiniMap({ items, layout, activeKey, transformState, viewport, onNavigate }) {
   const compact = viewport.width < 760;
   const width = compact ? 96 : 150;
   const height = compact ? 68 : 105;
@@ -1067,12 +1063,6 @@ function MiniMap({ items, layout, activeKey, transformState, viewport, onNavigat
         ))}
         {view && <span className="mini-map-viewport" style={{ left: view.x, top: view.y, width: view.width, height: view.height }} />}
       </button>
-      <button className="mini-map-recenter" type="button" onClick={onRecenter} aria-label="Recentrer sur les derniers ajouts" title="Recentrer">
-        <LocateFixed size={16} aria-hidden="true" />
-      </button>
-      <button className="mini-map-recenter" type="button" onClick={onDiscover} aria-label="Découvrir une référence" title="Découvrir">
-        <Shuffle size={16} aria-hidden="true" />
-      </button>
     </aside>
   );
 }
@@ -1093,7 +1083,8 @@ function DetailPanel({ reference, suggestions, onSelect, onClose, suspended }) {
   const type = supportType(reference);
   const embedSrc = reference.embed?.src || (type === 'web' && href ? href : '');
   const embedHtml = embedSrc ? '' : reference.embed?.html || '';
-  const canEmbed = Boolean(embedSrc || embedHtml);
+  const prefersCover = assetKind === 'cover' && ['book', 'chapter', 'thesis'].includes(type);
+  const canEmbed = !prefersCover && Boolean(embedSrc || embedHtml);
   const siteEmbed = canEmbed && type === 'web';
   const showMedia = canEmbed || (assetKind !== 'fallback' && reference.asset?.src);
 
@@ -1210,6 +1201,19 @@ function DetailPanel({ reference, suggestions, onSelect, onClose, suspended }) {
             {reference.bookTitle && <><dt>Dans</dt><dd>{reference.bookTitle}</dd></>}
             {reference.isbn && <><dt>ISBN</dt><dd>{reference.isbn}</dd></>}
             {reference.doi && <><dt>DOI</dt><dd>{reference.doi}</dd></>}
+            {reference.cover?.attribution && (
+              <>
+                <dt>Couverture</dt>
+                <dd className="cover-credit">
+                  {reference.cover.sourceUrl ? (
+                    <a href={reference.cover.sourceUrl} target="_blank" rel="noreferrer">
+                      {reference.cover.attribution}
+                    </a>
+                  ) : reference.cover.attribution}
+                  {reference.cover.retrievedAt && <small> · {reference.cover.retrievedAt}</small>}
+                </dd>
+              </>
+            )}
           </dl>
         </details>
       </div>
@@ -1706,7 +1710,7 @@ export default function App() {
           >
             {({ setTransform }) => (
               <AtlasViewport focalItems={focalItems} focusItem={focusItem} viewport={viewport} scale={fixedScale} setTransform={setTransform}>
-                {({ navigate, recenter }) => (
+                {({ navigate }) => (
                   <>
                     <MiniMap
                       items={visibleItems}
@@ -1715,8 +1719,6 @@ export default function App() {
                       transformState={transformState}
                       viewport={viewport}
                       onNavigate={navigate}
-                      onRecenter={recenter}
-                      onDiscover={discoverReference}
                     />
                     <TransformComponent wrapperClass="atlas-wrapper" contentClass="atlas-content">
                       <section className="atlas-surface" style={{ width: layout.width, height: layout.height }} aria-label="Table de références">

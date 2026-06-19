@@ -1,5 +1,8 @@
 import fs from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import os from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -14,6 +17,7 @@ const screenshotDir = path.join(mediaDir, 'screenshots');
 const fallbackDir = path.join(mediaDir, 'fallbacks');
 const cacheDir = path.join(projectRoot, '.cache');
 const assetCacheFile = path.join(cacheDir, 'zotscape-assets.json');
+const execFileAsync = promisify(execFile);
 
 function parseEnvLine(line) {
   const match = String(line || '').match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/iu);
@@ -50,7 +54,9 @@ const SKIP_SCREENSHOTS = process.env.ZOTSCAPE_SKIP_SCREENSHOTS === '1';
 const GOOGLE_BOOKS_API_KEY = process.env.GOOGLE_BOOKS_API_KEY || '';
 const USE_PUBLIC_GOOGLE_BOOKS = process.env.ZOTSCAPE_ENABLE_GOOGLE_BOOKS_PUBLIC === '1';
 const ISBNDB_API_KEY = process.env.ISBNDB_API_KEY || '';
-const COVER_PIPELINE_VERSION = 2;
+const COVER_PIPELINE_VERSION = 4;
+const COVER_FAILURE_CACHE_MS = 20 * 60 * 60 * 1000;
+const MAX_PUBLIC_PDF_BYTES = 50 * 1024 * 1024;
 const ATLAS_WIDTH = 3200;
 const ATLAS_HEIGHT = 2200;
 
@@ -727,7 +733,7 @@ function extensionForContentType(contentType, fallback = '.jpg') {
   return fallback;
 }
 
-async function imageLooksUsable(filePath, role = 'preview') {
+async function imageLooksUsable(filePath, role = 'preview', options = {}) {
   const stats = await fs.stat(filePath).catch(() => null);
   if (!stats || stats.size < (role === 'cover' ? 1100 : 700)) return false;
   const sharpModule = await import('sharp').catch(() => null);
@@ -740,7 +746,8 @@ async function imageLooksUsable(filePath, role = 'preview') {
     if (role === 'cover') {
       if (metadata.width < 80 || metadata.height < 110) return false;
       const ratio = metadata.width / metadata.height;
-      if (ratio < 0.32 || ratio > 1.25) return false;
+      const maxRatio = options.allowLandscapeCover ? 2 : 1.25;
+      if (ratio < 0.32 || ratio > maxRatio) return false;
     } else if (metadata.width < 120 || metadata.height < 80) {
       return false;
     }
@@ -763,7 +770,7 @@ async function downloadImage(url, targetBasePath, options = {}) {
   const extension = extensionForContentType(contentType);
   const filePath = `${targetBasePath}${extension}`;
   await fs.writeFile(filePath, bytes);
-  if (!await imageLooksUsable(filePath, options.role || 'preview')) {
+  if (!await imageLooksUsable(filePath, options.role || 'preview', options)) {
     await fs.unlink(filePath).catch(() => {});
     return null;
   }
@@ -783,12 +790,13 @@ async function imageDimensions(filePath) {
   };
 }
 
-async function coverAsset(filePath, source, identifier) {
+async function coverAsset(filePath, source, identifier, metadata = {}) {
   return {
     kind: 'cover',
     src: mediaPath(filePath),
     source,
     identifier,
+    ...metadata,
     ...await imageDimensions(filePath),
   };
 }
@@ -811,6 +819,77 @@ async function findOpenLibraryCover(reference) {
     const filePath = await downloadImage(url, path.join(coverDir, `${reference.key}-openlibrary-${isbn}`), { role: 'cover' }).catch(() => null);
     if (filePath) {
       return await coverAsset(filePath, 'openlibrary-isbn', isbn);
+    }
+  }
+  return null;
+}
+
+async function findBnfCover(reference) {
+  for (const isbn of reference.isbns.filter((value) => /^\d{13}$/u.test(value))) {
+    const url = new URL('https://openapi.bnf.fr/couverture/image/image/recupererImage');
+    url.searchParams.set('EAN', isbn);
+    url.searchParams.set('couverture', '1');
+    url.searchParams.set('taille', 'originale');
+    const response = await fetch(url, {
+      headers: {
+        Accept: 'image/*',
+        'User-Agent': 'zotscape/0.1 (+https://github.com)',
+      },
+      signal: AbortSignal.timeout(30_000),
+    }).catch(() => null);
+    // The BnF currently uses HTTP 500 to signal that a record has no cover.
+    if (!response?.ok) continue;
+    const contentType = response.headers.get('content-type') || '';
+    if (!contentType.toLowerCase().startsWith('image/')) continue;
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (bytes.length < 1100) continue;
+    const filePath = `${path.join(coverDir, `${reference.key}-bnf-${isbn}`)}${extensionForContentType(contentType)}`;
+    await fs.writeFile(filePath, bytes);
+    if (!await imageLooksUsable(filePath, 'cover')) {
+      await fs.unlink(filePath).catch(() => {});
+      continue;
+    }
+    return coverAsset(filePath, 'bnf-ean', isbn, {
+      sourceUrl: url.toString(),
+      attribution: 'Bibliothèque nationale de France',
+      retrievedAt: new Date().toISOString().slice(0, 10),
+    });
+  }
+  return null;
+}
+
+async function findInventaireCover(reference) {
+  for (const isbn of reference.isbns.filter((value) => /^\d{13}$/u.test(value))) {
+    const apiUrl = new URL('https://inventaire.io/api/entities/by-uris');
+    apiUrl.searchParams.set('uris', `isbn:${isbn}`);
+    const response = await fetchWithRetry(apiUrl, {
+      headers: { Accept: 'application/json' },
+      signal: AbortSignal.timeout(30_000),
+    }, 2).catch(() => null);
+    if (!response?.ok) continue;
+    const payload = await response.json().catch(() => null);
+    const entities = Object.values(payload?.entities || {});
+    for (const entity of entities) {
+      const candidateTitle = entity?.labels?.fromclaims || entity?.claims?.['wdt:P1476']?.[0] || '';
+      const titleMatches = titleOverlapScore(reference, candidateTitle) >= 0.35
+        || titlePrefixMatch(reference, candidateTitle);
+      if (!candidateTitle || !titleMatches) continue;
+      const imageHashes = Array.isArray(entity?.claims?.['invp:P2']) ? entity.claims['invp:P2'] : [];
+      for (const imageHash of imageHashes) {
+        const imageUrl = absoluteUrl(`/img/entities/${imageHash}`, 'https://inventaire.io');
+        if (!imageUrl) continue;
+        const filePath = await downloadImage(
+          imageUrl,
+          path.join(coverDir, `${reference.key}-inventaire-${isbn}-${hashIndex(imageUrl)}`),
+          { role: 'cover', allowLandscapeCover: true },
+        ).catch(() => null);
+        if (!filePath) continue;
+        return coverAsset(filePath, 'inventaire-isbn', isbn, {
+          sourceUrl: imageUrl,
+          attribution: 'Inventaire',
+          retrievedAt: new Date().toISOString().slice(0, 10),
+        });
+      }
     }
   }
   return null;
@@ -1248,30 +1327,175 @@ async function findIsbnDbCover(reference) {
   return null;
 }
 
-async function enrichCover(reference, assetCache) {
-  const cacheKey = `${COVER_PIPELINE_VERSION}:${reference.key}:${reference.version}:${reference.isbns.join(',')}:${reference.coverUrl || ''}`;
-  const cached = assetCache.covers?.[reference.key];
-  if (cached?.cacheKey && cached.cacheKey === cacheKey && cached.asset?.src) {
-    const filePath = path.join(publicRoot, cached.asset.src);
-    if (await exists(filePath) && await imageLooksUsable(filePath, 'cover')) {
-      if (!cached.asset.width || !cached.asset.height) {
-        cached.asset = { ...cached.asset, ...await imageDimensions(filePath) };
+let popplerToolsPromise;
+
+async function executableWorks(command) {
+  if (!command) return false;
+  try {
+    await execFileAsync(command, ['-v'], { timeout: 5_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function loadPopplerTools() {
+  if (!popplerToolsPromise) {
+    popplerToolsPromise = (async () => {
+      const candidates = [
+        [process.env.ZOTSCAPE_PDFTOPPM_PATH, process.env.ZOTSCAPE_PDFTOTEXT_PATH],
+        ['pdftoppm', 'pdftotext'],
+        ['/opt/homebrew/bin/pdftoppm', '/opt/homebrew/bin/pdftotext'],
+        ['/usr/local/bin/pdftoppm', '/usr/local/bin/pdftotext'],
+      ];
+      for (const [pdftoppm, pdftotext] of candidates) {
+        if (await executableWorks(pdftoppm) && await executableWorks(pdftotext)) {
+          return { pdftoppm, pdftotext };
+        }
       }
-      return cached.asset;
+      return null;
+    })();
+  }
+  return popplerToolsPromise;
+}
+
+async function responseBufferWithLimit(response, maxBytes) {
+  const reader = response.body?.getReader();
+  if (!reader) return null;
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => {});
+      return null;
+    }
+    chunks.push(Buffer.from(value));
+  }
+  return Buffer.concat(chunks, total);
+}
+
+async function downloadPublicPdf(url, filePath) {
+  const response = await fetchWithRetry(url, {
+    headers: { Accept: 'application/pdf' },
+    signal: AbortSignal.timeout(75_000),
+  }, 2).catch(() => null);
+  if (!response?.ok || !publicUrl(response.url)) return false;
+  const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+  if (!contentType.includes('pdf') && !new URL(response.url).pathname.toLowerCase().endsWith('.pdf')) return false;
+  const contentLength = Number(response.headers.get('content-length') || 0);
+  if (contentLength > MAX_PUBLIC_PDF_BYTES) return false;
+  const bytes = await responseBufferWithLimit(response, MAX_PUBLIC_PDF_BYTES);
+  if (!bytes || bytes.length < 5 || bytes.subarray(0, 5).toString() !== '%PDF-') return false;
+  await fs.writeFile(filePath, bytes);
+  return true;
+}
+
+async function renderPdfPage(tools, sourcePath, page, outputPrefix) {
+  await execFileAsync(tools.pdftoppm, [
+    '-f', String(page),
+    '-l', String(page),
+    '-singlefile',
+    '-png',
+    '-r', '140',
+    sourcePath,
+    outputPrefix,
+  ], { timeout: 60_000, maxBuffer: 1024 * 1024 });
+  const outputPath = `${outputPrefix}.png`;
+  return await exists(outputPath) ? outputPath : '';
+}
+
+async function findPublicPdfCover(reference) {
+  const attachments = reference.publicPdfAttachments || [];
+  if (!COVER_OBJECT_TYPES.has(reference.itemType) || !attachments.length) return null;
+  const tools = await loadPopplerTools();
+  if (!tools) return null;
+  const sharpModule = await import('sharp').catch(() => null);
+  const sharp = sharpModule?.default || sharpModule;
+  if (!sharp) return null;
+
+  for (const attachment of attachments) {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'zotscape-pdf-'));
+    try {
+      const sourcePath = path.join(tempDir, 'source.pdf');
+      if (!await downloadPublicPdf(attachment.url, sourcePath)) continue;
+      const { stdout: firstPageText = '' } = await execFileAsync(tools.pdftotext, [
+        '-f', '1',
+        '-l', '1',
+        sourcePath,
+        '-',
+      ], { timeout: 30_000, maxBuffer: 2 * 1024 * 1024 }).catch(() => ({ stdout: '' }));
+      const startsWithHalWrapper = /\bHAL Id\b|To cite this version|Submitted on/iu.test(firstPageText);
+      const preferredPage = startsWithHalWrapper ? 2 : 1;
+      let renderedPath = await renderPdfPage(tools, sourcePath, preferredPage, path.join(tempDir, 'cover')).catch(() => '');
+      let renderedPage = preferredPage;
+      if (!renderedPath && preferredPage !== 1) {
+        renderedPath = await renderPdfPage(tools, sourcePath, 1, path.join(tempDir, 'cover')).catch(() => '');
+        renderedPage = 1;
+      }
+      if (!renderedPath) continue;
+      const filePath = path.join(coverDir, `${reference.key}-public-pdf-${attachment.key}-p${renderedPage}.webp`);
+      await sharp(renderedPath)
+        .rotate()
+        .resize({ width: 1200, height: 1600, fit: 'inside', withoutEnlargement: true })
+        .webp({ quality: 88 })
+        .toFile(filePath);
+      if (!await imageLooksUsable(filePath, 'cover')) {
+        await fs.unlink(filePath).catch(() => {});
+        continue;
+      }
+      const hostname = new URL(attachment.url).hostname;
+      return coverAsset(filePath, 'public-pdf', `${attachment.key}:page-${renderedPage}`, {
+        sourceUrl: attachment.url,
+        attribution: hostname === 'hal.science' ? 'HAL open science' : hostname,
+        retrievedAt: new Date().toISOString().slice(0, 10),
+      });
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+  return null;
+}
+
+async function enrichCover(reference, assetCache) {
+  const pdfCachePart = (reference.publicPdfAttachments || [])
+    .map((attachment) => `${attachment.key}:${attachment.version}:${attachment.url}`)
+    .join(',');
+  const cacheKey = `${COVER_PIPELINE_VERSION}:${reference.key}:${reference.version}:${reference.isbns.join(',')}:${reference.coverUrl || ''}:${pdfCachePart}`;
+  const cached = assetCache.covers?.[reference.key];
+  if (cached?.cacheKey === cacheKey) {
+    if (!cached.asset) {
+      const checkedAt = Date.parse(cached.checkedAt || '');
+      if (Number.isFinite(checkedAt) && Date.now() - checkedAt < COVER_FAILURE_CACHE_MS) return null;
+    } else if (cached.asset.src) {
+      const filePath = path.join(publicRoot, cached.asset.src);
+      const allowLandscapeCover = cached.asset.source === 'inventaire-isbn';
+      if (await exists(filePath) && await imageLooksUsable(filePath, 'cover', { allowLandscapeCover })) {
+        if (!cached.asset.width || !cached.asset.height) {
+          cached.asset = { ...cached.asset, ...await imageDimensions(filePath) };
+        }
+        return cached.asset;
+      }
     }
   }
   const canSearchByTitle = ['book', 'bookSection', 'thesis'].includes(reference.itemType)
     && reference.title
     && (reference.creators || []).length;
-  if (!reference.coverUrl && !reference.isbns.length && !canSearchByTitle) return null;
+  const canUsePublicPdf = (reference.publicPdfAttachments || []).length > 0;
+  if (!reference.coverUrl && !reference.isbns.length && !canSearchByTitle && !canUsePublicPdf) return null;
   const asset = await findManualCover(reference)
     || await findOpenLibraryCover(reference)
+    || await findBnfCover(reference)
+    || await findInventaireCover(reference)
     || await findOpenLibraryRelatedEditionCover(reference)
     || await findOpenLibrarySearchCover(reference)
     || await findGoogleBooksCover(reference)
     || await findGoogleBooksSearchCover(reference)
-    || await findIsbnDbCover(reference);
-  assetCache.covers[reference.key] = { cacheKey, asset };
+    || await findIsbnDbCover(reference)
+    || await findPublicPdfCover(reference);
+  assetCache.covers[reference.key] = { cacheKey, asset, checkedAt: new Date().toISOString() };
   return asset;
 }
 
@@ -1572,7 +1796,7 @@ function normalizeReference(item, context) {
   const year = extractYear(item);
   const title = normalizeSpace(data.title || data.shortTitle || 'Sans titre');
   const url = publicUrl(data.url);
-  return {
+  const reference = {
     key: item.key,
     version: item.version ?? data.version ?? null,
     itemType: data.itemType || 'document',
@@ -1625,6 +1849,22 @@ function normalizeReference(item, context) {
     },
     layout: null,
   };
+  const publicPdfAttachments = attachments
+    .filter((attachment) => attachment.data?.contentType === 'application/pdf')
+    .map((attachment) => ({
+      key: attachment.key,
+      version: attachment.version ?? attachment.data?.version ?? null,
+      url: publicUrl(attachment.data?.url),
+    }))
+    .filter((attachment) => attachment.url);
+  if (reference.publicPdfUrl && !publicPdfAttachments.some((attachment) => attachment.url === reference.publicPdfUrl)) {
+    publicPdfAttachments.unshift({ key: reference.key, version: reference.version, url: reference.publicPdfUrl });
+  }
+  Object.defineProperty(reference, 'publicPdfAttachments', {
+    enumerable: false,
+    value: publicPdfAttachments,
+  });
+  return reference;
 }
 
 function computeMemoirStats(memoir, references) {
@@ -1765,6 +2005,40 @@ function copyReferenceEnrichments(target, source) {
   for (const field of CATALOG_ENRICHMENT_FIELDS) target[field] = source[field] ?? null;
 }
 
+function summarizeCoverCoverage(references) {
+  const byType = {};
+  const bySource = {};
+  for (const reference of references.filter((entry) => COVER_OBJECT_TYPES.has(entry.itemType))) {
+    byType[reference.itemType] ||= { total: 0, covered: 0 };
+    byType[reference.itemType].total += 1;
+    if (reference.cover) {
+      byType[reference.itemType].covered += 1;
+      const source = reference.cover.source || 'unknown';
+      bySource[source] = (bySource[source] || 0) + 1;
+    }
+  }
+  const books = byType.book || { total: 0, covered: 0 };
+  return {
+    books: {
+      ...books,
+      rate: books.total ? Number((books.covered / books.total).toFixed(4)) : 0,
+    },
+    byType,
+    bySource,
+  };
+}
+
+function logCoverCoverage(references) {
+  const coverage = summarizeCoverCoverage(references);
+  const percent = Math.round(coverage.books.rate * 10_000) / 100;
+  log(`Book cover coverage: ${coverage.books.covered}/${coverage.books.total} (${percent}%).`);
+  const sources = Object.entries(coverage.bySource)
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .map(([source, count]) => `${source}=${count}`)
+    .join(', ');
+  log(`Cover sources: ${sources || 'none'}.`);
+}
+
 function createYearCatalog(descriptor, metadata) {
   const { references, memoirs, rootCollection, selectedTopItems, year } = descriptor;
   const memoirsWithStats = memoirs.map((memoir) => computeMemoirStats(memoir, references));
@@ -1802,6 +2076,7 @@ function createYearCatalog(descriptor, metadata) {
       annotationCount: references.reduce((sum, reference) => sum + reference.annotations.count, 0),
       noteCount: references.reduce((sum, reference) => sum + reference.notes.length, 0),
       attachmentCount: references.reduce((sum, reference) => sum + reference.attachments.count, 0),
+      coverCoverage: summarizeCoverCoverage(references),
     },
     layout: computeAtlasLayout(references, memoirs),
     memoirs: memoirsWithStats,
@@ -1956,6 +2231,8 @@ async function main() {
     }
     await screenshotTools.browser.close().catch(() => {});
   }
+
+  logCoverCoverage(references);
 
   for (const reference of references) {
     reference.asset = chooseCardAsset(reference);

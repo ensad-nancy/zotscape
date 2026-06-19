@@ -26,6 +26,10 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: Install PDF cover tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils
       - run: npx playwright install --with-deps chromium
       - uses: actions/cache@v4
         with:

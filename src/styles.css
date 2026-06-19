@@ -345,21 +345,7 @@ p {
   cursor: crosshair;
 }
 
-.mini-map-recenter {
-  display: grid;
-  width: 30px;
-  height: 30px;
-  place-items: center;
-  padding: 0;
-  color: var(--ink);
-  background: rgba(251, 251, 245, 0.88);
-  border: 0;
-  border-radius: 3px;
-  cursor: pointer;
-}
-
 .mini-map-board:focus-visible,
-.mini-map-recenter:focus-visible,
 .atlas-meeting-label:focus-visible,
 .list-discover:focus-visible,
 .memoir-filter button:focus-visible,
@@ -1987,6 +1973,19 @@ p {
   font-weight: 750;
 }
 
+.cover-credit a {
+  color: inherit;
+  text-decoration-color: var(--accent);
+  text-decoration-thickness: 2px;
+  text-underline-offset: 3px;
+}
+
+.cover-credit small {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .detail-rubrics {
   display: flex;
   flex-wrap: wrap;
@@ -2162,11 +2161,6 @@ p {
     bottom: 10px;
     left: 10px;
     padding: 3px;
-  }
-
-  .mini-map-recenter {
-    width: 28px;
-    height: 28px;
   }
 
   .reference-list-view {
