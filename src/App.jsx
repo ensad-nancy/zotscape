@@ -23,7 +23,9 @@ const DEFAULT_LAYOUT = { width: 1800, height: 1200 };
 const RECENT_REFERENCE_COUNT = 6;
 const VIEW_MODES = new Set(['atlas', 'list']);
 const LIST_SORTS = new Set(['recent', 'title', 'author', 'year']);
-const REFERENCE_KEY_PATTERN = /--([a-z0-9]{8})$/iu;
+const LEGACY_REFERENCE_KEY_PATTERN = /^[a-z0-9]{8}$/iu;
+const REFERENCE_HASH_SUFFIX_PATTERN = /--([^#/]+)$/u;
+const IMAGE_PREVIEW_KINDS = new Set(['open-graph', 'archive', 'screenshot', 'pdf-screenshot', 'oembed']);
 const catalogCache = new Map();
 
 const FALLBACK_PALETTES = [
@@ -93,27 +95,50 @@ function writeViewParams(view, sort, year, defaultYear, historyMode = 'replace')
   );
 }
 
-function referenceSlug(reference) {
-  return normalize(reference?.title || 'reference')
+function slugifyHashPart(value, fallback = 'reference') {
+  return normalize(value || fallback)
     .replace(/[^a-z0-9]+/gu, '-')
     .replace(/^-+|-+$/gu, '')
     .slice(0, 72)
-    .replace(/-+$/gu, '') || 'reference';
+    .replace(/-+$/gu, '') || fallback;
+}
+
+function referenceTitleSlug(reference) {
+  return slugifyHashPart(reference?.title, 'reference');
+}
+
+function referenceCitekeySlug(reference) {
+  return slugifyHashPart(reference?.citationKey || reference?.key, String(reference?.key || 'reference').toLowerCase());
 }
 
 function referenceHash(reference) {
   if (!reference?.key) return '';
-  return `#${referenceSlug(reference)}--${String(reference.key).toUpperCase()}`;
+  return `#${referenceTitleSlug(reference)}--${referenceCitekeySlug(reference)}`;
 }
 
-function referenceKeyFromHash(hash = window.location.hash) {
+function referenceTokenFromHash(hash = window.location.hash) {
   let decoded = String(hash || '');
   try {
     decoded = decodeURIComponent(decoded);
   } catch {
     // An invalid user-edited hash is handled like an unknown reference.
   }
-  return decoded.match(REFERENCE_KEY_PATTERN)?.[1]?.toUpperCase() || '';
+  return slugifyHashPart(decoded.match(REFERENCE_HASH_SUFFIX_PATTERN)?.[1] || '', '');
+}
+
+function referenceMatchesToken(reference, token) {
+  if (!reference || !token) return false;
+  return token === referenceCitekeySlug(reference) || token === slugifyHashPart(reference.key, '');
+}
+
+function findReferenceByHashToken(references, token) {
+  if (!token) return null;
+  return references.find((reference) => referenceMatchesToken(reference, token)) || null;
+}
+
+function referenceYearsForHashToken(index, token) {
+  if (!token || !LEGACY_REFERENCE_KEY_PATTERN.test(token)) return [];
+  return index.referenceYears?.[token.toUpperCase()] || [];
 }
 
 function writeReferenceHash(reference, year, defaultYear, historyMode = 'replace', detailEntry = false) {
@@ -238,23 +263,54 @@ function memoirReaderLabel(name = '') {
     : display.primary;
 }
 
-function objectDimensions(reference, featured = false) {
+function objectDimensions(reference, featured = false, measuredRatios = new Map()) {
   const type = supportType(reference);
   const assetKind = reference.asset?.kind || 'fallback';
-  const shared = reference.memoirKeys?.length > 1;
   const seed = hashValue(reference.key || reference.title);
-  const scale = (shared ? 1.04 : 1) * ([0.96, 1, 1.04][seed % 3]) * (featured ? 1.1 : 1);
-  const captionHeight = featured ? 98 : 80;
+  const scale = ([0.96, 1, 1.04][seed % 3]) * (featured ? 1.02 : 0.9);
+  const captionHeight = featured ? 98 : 86;
   const gap = 10;
   if (assetKind === 'cover' && ['book', 'chapter', 'thesis'].includes(type)) {
-    const ratio = clamp(Number(reference.asset?.ratio || 0.66), 0.42, 0.9);
+    const rawRatio = Number(reference.asset?.ratio || 0.66);
+    if (rawRatio > 1.08) {
+      const ratio = clamp(rawRatio, 1.08, 1.92);
+      const widthBase = {
+        book: 380,
+        chapter: 360,
+        thesis: 372,
+      }[type];
+      const width = Math.round(widthBase * scale);
+      const mediaHeight = Math.round(clamp(width / ratio, 156, 248));
+      return {
+        width,
+        height: mediaHeight + gap + captionHeight,
+        mediaHeight,
+        captionHeight,
+      };
+    }
+    const ratio = clamp(rawRatio, 0.42, 0.9);
     const mediaHeightBase = {
-      book: shared ? 372 : 346,
-      chapter: shared ? 336 : 312,
-      thesis: shared ? 370 : 344,
+      book: 346,
+      chapter: 312,
+      thesis: 344,
     }[type];
     const mediaHeight = Math.round(mediaHeightBase * scale);
     const width = Math.round(clamp(mediaHeight * ratio, type === 'chapter' ? 176 : 190, type === 'thesis' ? 276 : 286));
+    return {
+      width,
+      height: mediaHeight + gap + captionHeight,
+      mediaHeight,
+      captionHeight,
+    };
+  }
+  if (IMAGE_PREVIEW_KINDS.has(assetKind) && ['article', 'document', 'web'].includes(type)) {
+    const measuredRatio = Number(measuredRatios.get(reference.key) || 0);
+    const fallbackRatio = assetKind === 'archive' || assetKind === 'screenshot' ? 1.86 : 1.58;
+    const ratio = clamp(Number(reference.asset?.ratio || measuredRatio || fallbackRatio), 0.5, 3);
+    const widthBase = type === 'article' ? 330 : 340;
+    const width = Math.round(widthBase * scale);
+    const chromeHeight = type === 'web' ? 34 : 0;
+    const mediaHeight = Math.round(clamp((width - (type === 'web' ? 16 : 0)) / ratio + chromeHeight, 112 * scale, 292 * scale));
     return {
       width,
       height: mediaHeight + gap + captionHeight,
@@ -374,24 +430,14 @@ function sourceActionLabel(reference) {
   return 'Consulter la ressource';
 }
 
-function packReferences(references, viewport, recentKeys, sharedKeys, sharedOnly) {
+function packReferences(references, viewport, recentKeys, sharedKeys, sharedOnly, measuredRatios = new Map()) {
   const compact = viewport.width < 760;
   const margin = compact ? 64 : 104;
   const tableWidth = clamp(
-    viewport.width * (compact ? 3.25 : 1.52),
-    compact ? 1260 : 1900,
-    compact ? 1520 : 2300,
+    viewport.width * (compact ? 3.45 : 2),
+    compact ? 1320 : 2550,
+    compact ? 1660 : 3000,
   );
-  const tableBaseHeight = compact ? 2580 : 2280;
-  const anchors = [
-    [0.06, 0.06], [0.22, 0.03], [0.78, 0.05], [0.88, 0.18],
-    [0.05, 0.24], [0.19, 0.30], [0.83, 0.35], [0.91, 0.50],
-    [0.04, 0.46], [0.18, 0.52], [0.32, 0.59], [0.51, 0.61],
-    [0.72, 0.60], [0.86, 0.67], [0.07, 0.68], [0.23, 0.75],
-    [0.43, 0.76], [0.63, 0.78], [0.81, 0.82], [0.12, 0.89],
-    [0.34, 0.92], [0.57, 0.91], [0.78, 0.94], [0.94, 0.74],
-    [0.50, 0.02], [0.02, 0.82], [0.94, 0.31],
-  ];
   const placedLayouts = [];
   const orderedReferences = [...references].sort((left, right) => {
     const recentDifference = Number(recentKeys.has(right.key)) - Number(recentKeys.has(left.key));
@@ -407,21 +453,31 @@ function packReferences(references, viewport, recentKeys, sharedKeys, sharedOnly
     : (visibleRecent.length ? visibleRecent : orderedReferences.slice(0, RECENT_REFERENCE_COUNT));
   const featuredKeys = new Set(featuredReferences.map((reference) => reference.key));
   const layoutsByKey = new Map();
-  const collides = (layout) => placedLayouts.some((placed) => (
-    layout.x < placed.x + placed.width + 42
-    && layout.x + layout.width + 42 > placed.x
-    && layout.y < placed.y + placed.height + 42
-    && layout.y + layout.height + 42 > placed.y
+  const collisionGap = compact ? 20 : 22;
+  const firstCollision = (layout) => placedLayouts.find((placed) => (
+    layout.x < placed.x + placed.width + collisionGap
+    && layout.x + layout.width + collisionGap > placed.x
+    && layout.y < placed.y + placed.height + collisionGap
+    && layout.y + layout.height + collisionGap > placed.y
   ));
+  const settleLayout = (layout) => {
+    let guard = 0;
+    let conflict = firstCollision(layout);
+    while (conflict && guard < 180) {
+      layout.y = conflict.y + conflict.height + collisionGap;
+      conflict = firstCollision(layout);
+      guard += 1;
+    }
+  };
 
   const columns = Math.min(3, Math.max(1, featuredReferences.length));
-  const horizontalGap = compact ? 54 : 72;
-  const verticalGap = compact ? 64 : 76;
-  let featuredY = compact ? 260 : 250;
+  const horizontalGap = compact ? 34 : 42;
+  const verticalGap = compact ? 28 : 34;
+  let featuredY = compact ? 138 : 122;
   for (let rowStart = 0; rowStart < featuredReferences.length; rowStart += columns) {
     const row = featuredReferences.slice(rowStart, rowStart + columns).map((reference) => ({
       reference,
-      size: objectDimensions(reference, true),
+      size: objectDimensions(reference, true, measuredRatios),
     }));
     const rowWidth = row.reduce((sum, item) => sum + item.size.width, 0) + horizontalGap * (row.length - 1);
     const rowHeight = Math.max(...row.map((item) => item.size.height));
@@ -451,86 +507,81 @@ function packReferences(references, viewport, recentKeys, sharedKeys, sharedOnly
     sharedKeys.has(reference.key) && !featuredKeys.has(reference.key)
   ));
   const meetingKeys = new Set(meetingReferences.map((reference) => reference.key));
-  const meetingColumns = Math.min(3, Math.max(1, meetingReferences.length));
-  let meetingY = featuredY + (meetingReferences.length ? (compact ? 160 : 210) : 0);
-  for (let rowStart = 0; rowStart < meetingReferences.length; rowStart += meetingColumns) {
-    const row = meetingReferences.slice(rowStart, rowStart + meetingColumns).map((reference) => ({
-      reference,
-      size: objectDimensions(reference, false),
-    }));
-    const rowWidth = row.reduce((sum, item) => sum + item.size.width, 0) + horizontalGap * (row.length - 1);
-    const rowHeight = Math.max(...row.map((item) => item.size.height));
-    let meetingX = Math.round((tableWidth - rowWidth) / 2);
-    row.forEach(({ reference, size }, rowIndex) => {
-      const seed = hashValue(`meeting:${reference.key}:${rowStart + rowIndex}`);
-      const layout = {
-        index: featuredReferences.length + rowStart + rowIndex + 1,
-        x: meetingX,
-        y: meetingY + Math.round((((seed >> 8) % 100) / 100 - 0.5) * 34),
-        width: size.width,
-        height: size.height,
-        mediaHeight: size.mediaHeight,
-        captionHeight: size.captionHeight,
-        rotation: 0,
-        layer: 3,
-        featured: false,
-        meeting: true,
-      };
-      placedLayouts.push(layout);
-      layoutsByKey.set(reference.key, layout);
-      meetingX += size.width + horizontalGap;
-    });
-    meetingY += rowHeight + verticalGap;
-  }
 
   const regularReferences = orderedReferences.filter((reference) => (
     !featuredKeys.has(reference.key) && !meetingKeys.has(reference.key)
   ));
-  regularReferences.forEach((reference, index) => {
-    const size = objectDimensions(reference, false);
-    const seed = hashValue(`${reference.key}:${index}`);
-    const anchor = anchors[index % anchors.length];
-    const panel = Math.floor(index / anchors.length);
-    const jitterX = Math.round((((seed % 100) / 100) - 0.5) * (compact ? 54 : 82));
-    const jitterY = Math.round(((((seed >> 8) % 100) / 100) - 0.5) * (compact ? 48 : 76));
-    const panelOffset = panel * tableBaseHeight;
+
+  const contentWidth = tableWidth - margin * 2;
+  const columnGap = compact ? 28 : 34;
+  const columnCount = compact
+    ? clamp(Math.floor(contentWidth / 330), 3, 4)
+    : clamp(Math.floor(contentWidth / 330), 5, 7);
+  const columnWidth = (contentWidth - columnGap * (columnCount - 1)) / columnCount;
+  const laneTops = Array(columnCount).fill(compact ? 142 : 128);
+  const laneGapY = compact ? 22 : 26;
+
+  const placeInLanes = (reference, index, meeting = false) => {
+    const size = objectDimensions(reference, false, measuredRatios);
+    const seed = hashValue(`${meeting ? 'meeting' : 'regular'}:${reference.key}:${index}`);
+    const span = size.width <= columnWidth + columnGap * 0.45
+      ? 1
+      : Math.min(columnCount, Math.ceil((size.width + columnGap) / (columnWidth + columnGap)));
+    let bestStart = 0;
+    let bestScore = Number.POSITIVE_INFINITY;
+    for (let start = 0; start <= columnCount - span; start += 1) {
+      const laneY = Math.max(...laneTops.slice(start, start + span));
+      const tieBreak = ((hashValue(`${reference.key}:${start}`) % 19) - 9) / 10;
+      const score = laneY + tieBreak;
+      if (score < bestScore) {
+        bestScore = score;
+        bestStart = start;
+      }
+    }
+    const slotLeft = margin + bestStart * (columnWidth + columnGap);
+    const slotWidth = columnWidth * span + columnGap * (span - 1);
+    const spareX = Math.max(0, slotWidth - size.width);
+    const jitterLimit = Math.min(spareX / 2, compact ? 16 : 24);
+    const jitterX = Math.round(((((seed >> 16) % 100) / 100) - 0.5) * jitterLimit * 2);
+    const jitterY = Math.round((((seed >> 8) % 100) / 100) * (compact ? 10 : 14));
     const layout = {
-      index: featuredReferences.length + meetingReferences.length + index + 1,
+      index: featuredReferences.length + index + 1,
       x: clamp(
-        Math.round(margin + anchor[0] * (tableWidth - margin * 2 - size.width) + jitterX),
+        Math.round(slotLeft + (slotWidth - size.width) / 2 + jitterX),
         margin,
         Math.max(margin, tableWidth - margin - size.width),
       ),
-      y: Math.max(margin, Math.round(margin + panelOffset + anchor[1] * tableBaseHeight + jitterY)),
+      y: Math.max(margin, Math.round(Math.max(...laneTops.slice(bestStart, bestStart + span)) + jitterY)),
       width: size.width,
       height: size.height,
       mediaHeight: size.mediaHeight,
       captionHeight: size.captionHeight,
       rotation: 0,
-      layer: reference.memoirKeys?.length > 1 ? 3 : 1,
+      layer: meeting || reference.memoirKeys?.length > 1 ? 3 : 1,
       featured: false,
+      meeting,
     };
-    let guard = 0;
-    const shifts = [
-      [0, 0], [54, 34], [-58, 42], [92, 82], [-98, 92], [18, 138],
-      [132, 142], [-138, 154], [0, 214], [74, 250], [-80, 268],
-    ];
-    while (collides(layout) && guard < 120) {
-      const shift = shifts[guard % shifts.length];
-      const pass = Math.floor(guard / shifts.length);
-      layout.x = clamp(
-        Math.round(margin + anchor[0] * (tableWidth - margin * 2 - size.width) + jitterX + shift[0]),
-        margin,
-        Math.max(margin, tableWidth - margin - size.width),
-      );
-      layout.y = Math.max(margin, Math.round(margin + panelOffset + anchor[1] * tableBaseHeight + jitterY + shift[1] + pass * 96));
-      guard += 1;
-    }
-    if (collides(layout)) {
-      layout.y = Math.max(...placedLayouts.map((placed) => placed.y + placed.height)) + 56;
+    settleLayout(layout);
+    const nextLaneTop = layout.y + layout.height + laneGapY;
+    for (let lane = bestStart; lane < bestStart + span; lane += 1) {
+      laneTops[lane] = Math.max(laneTops[lane], nextLaneTop);
     }
     placedLayouts.push(layout);
     layoutsByKey.set(reference.key, layout);
+  };
+
+  meetingReferences.forEach((reference, index) => {
+    placeInLanes(reference, index, true);
+  });
+  const regularPlacementOrder = [...regularReferences].sort((left, right) => {
+    const leftSize = objectDimensions(left, false);
+    const rightSize = objectDimensions(right, false);
+    return (rightSize.width * rightSize.height) - (leftSize.width * leftSize.height)
+      || rightSize.width - leftSize.width
+      || sortByRecent(left, right);
+  });
+  regularPlacementOrder.forEach((reference, index) => {
+    placeInLanes(reference, meetingReferences.length + index, false);
   });
   const items = orderedReferences.map((reference) => ({ reference, layout: layoutsByKey.get(reference.key) }));
   const tableHeight = Math.max(...placedLayouts.map((layout) => layout.y + layout.height), viewport.height + 320) + margin;
@@ -552,6 +603,29 @@ function sourceHref(reference) {
   return reference.url || reference.doiUrl || '';
 }
 
+function openExternalHref(event, href) {
+  if (!href || event.defaultPrevented || event.button !== 0) return;
+  if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  window.open(href, '_blank', 'noopener,noreferrer');
+}
+
+function ExternalLink({ href, children, onClick, ...props }) {
+  return (
+    <a
+      {...props}
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      onClick={(event) => {
+        onClick?.(event);
+        openExternalHref(event, href);
+      }}
+    >
+      {children}
+    </a>
+  );
+}
 
 function fallbackPalette(reference) {
   const [paper, ink, accent] = FALLBACK_PALETTES[hashValue(reference.key || reference.title) % FALLBACK_PALETTES.length];
@@ -562,24 +636,53 @@ function fallbackPalette(reference) {
   };
 }
 
-function ReferenceVisual({ reference, detail = false }) {
+function ReferenceStickers({ recent = false, shared = false, className = '' }) {
+  if (!recent && !shared) return null;
+  return (
+    <span className={`object-stickers${className ? ` ${className}` : ''}`} aria-hidden="true">
+      {recent && <span className="object-sticker object-sticker--new">new</span>}
+      {shared && <span className="object-sticker object-sticker--shared">🔥</span>}
+    </span>
+  );
+}
+
+function ReferenceVisual({ reference, detail = false, overlay = null, onImageRatio = null }) {
   const assetKind = reference.asset?.kind || 'fallback';
   const type = supportType(reference);
   if (assetKind === 'fallback') {
+    const showKicker = !(type === 'web' && !detail);
     return (
       <span
         className={`dom-fallback dom-fallback--${type}${detail ? ' dom-fallback--detail' : ''}`}
         style={fallbackPalette(reference)}
       >
-        <span className="dom-fallback-kicker">{reference.typeLabel}</span>
+        {showKicker && <span className="dom-fallback-kicker">{reference.typeLabel}</span>}
         <strong>{reference.title}</strong>
         {reference.creatorsLabel && <span className="dom-fallback-authors">{reference.creatorsLabel}</span>}
         <em>{reference.year || 's. d.'}</em>
+        {overlay}
       </span>
     );
   }
   if (!reference.asset?.src) return null;
-  return <img src={assetUrl(reference.asset.src)} alt="" loading={detail ? 'eager' : 'lazy'} />;
+  const image = (
+    <img
+      src={assetUrl(reference.asset.src)}
+      alt=""
+      loading={detail ? 'eager' : 'lazy'}
+      onLoad={onImageRatio ? (event) => {
+        const { naturalWidth, naturalHeight } = event.currentTarget;
+        if (naturalWidth > 0 && naturalHeight > 0) onImageRatio(naturalWidth / naturalHeight);
+      } : undefined}
+    />
+  );
+  if (detail) return image;
+  return (
+    <span className={`object-visual-shell object-visual-shell--${assetKind} object-visual-shell--${type}`}>
+      {image}
+      {overlay}
+    </span>
+  );
 }
 
 function MiniMapVisual({ reference }) {
@@ -676,19 +779,11 @@ function YearSelector({ activeYear, years, onChange }) {
   );
 }
 
-function ListVisual({ reference }) {
-  if (reference.asset?.kind === 'fallback') {
-    return (
-      <span className={`list-fallback list-fallback--${supportType(reference)}`} style={fallbackPalette(reference)}>
-        <span>{reference.typeLabel}</span>
-      </span>
-    );
-  }
-  if (!reference.asset?.src) return null;
-  return <img src={assetUrl(reference.asset.src)} alt="" loading="lazy" />;
+function ListVisual({ reference, overlay = null }) {
+  return <ReferenceVisual reference={reference} overlay={overlay} />;
 }
 
-function ReferenceListRow({ reference, active, onSelect }) {
+function ReferenceListRow({ reference, active, recent, shared, onSelect }) {
   const annotationCount = reference.annotations?.count || 0;
   const noteCount = reference.notes?.length || 0;
   const context = [
@@ -707,7 +802,10 @@ function ReferenceListRow({ reference, active, onSelect }) {
         aria-label={`${reference.title}, ${reference.creatorsLabel}`}
       >
         <span className={`reference-list-visual reference-list-visual--${supportType(reference)}`}>
-          <ListVisual reference={reference} />
+          <ListVisual
+            reference={reference}
+            overlay={<ReferenceStickers recent={recent} shared={shared} className="reference-list-stickers" />}
+          />
         </span>
         <span className="reference-list-copy">
           <span className="reference-list-heading">
@@ -723,7 +821,7 @@ function ReferenceListRow({ reference, active, onSelect }) {
   );
 }
 
-function ReferenceList({ references, sort, onSortChange, recentKeys, selectedReference, onSelect, onDiscover }) {
+function ReferenceList({ references, sort, onSortChange, recentKeys, sharedKeys, selectedReference, onSelect, onDiscover }) {
   const recentReferences = sort === 'recent'
     ? references.filter((reference) => recentKeys.has(reference.key))
     : [];
@@ -766,6 +864,8 @@ function ReferenceList({ references, sort, onSortChange, recentKeys, selectedRef
                 key={reference.key}
                 reference={reference}
                 active={selectedReference?.key === reference.key}
+                recent={recentKeys.has(reference.key)}
+                shared={sharedKeys.has(reference.key)}
                 onSelect={onSelect}
               />
             ))}
@@ -931,33 +1031,35 @@ function AboutPanel({ open, catalog, onClose }) {
         </dl>
         <p className="about-updated">Mis à jour le {formatUpdated(catalog.generatedAt)}</p>
         <div className="about-links">
-          <a href={catalog.source.groupUrl} target="_blank" rel="noreferrer">
+          <ExternalLink href={catalog.source.groupUrl}>
             <Library size={16} aria-hidden="true" /> Groupe Zotero
-          </a>
-          <a href={catalog.source.rootCollectionUrl} target="_blank" rel="noreferrer">
+          </ExternalLink>
+          <ExternalLink href={catalog.source.rootCollectionUrl}>
             <ArrowUpRight size={16} aria-hidden="true" /> Collection Zotero
-          </a>
+          </ExternalLink>
         </div>
       </aside>
     </>
   );
 }
 
-function AtlasObject({ reference, layout, active, related, recent, shared, onSelect, onHover }) {
+function AtlasObject({ reference, layout, active, related, recent, shared, onSelect, onHover, onImageRatio }) {
   const assetKind = reference.asset?.kind || 'fallback';
   const type = supportType(reference);
-  const transform = `translate(${layout.x}px, ${layout.y}px)`;
+  const landscapeCover = assetKind === 'cover' && Number(reference.asset?.ratio || 0) > 1.08;
+  const stickers = <ReferenceStickers recent={recent} shared={shared} />;
 
   return (
     <article
-      className={`atlas-object atlas-object--${assetKind} atlas-object--${type}${active ? ' is-active' : ''}${related ? ' is-related' : ''}${recent ? ' is-recent' : ''}${shared ? ' is-shared' : ''}`}
+      className={`atlas-object atlas-object--${assetKind} atlas-object--${type}${active ? ' is-active' : ''}${related ? ' is-related' : ''}${recent ? ' is-recent' : ''}${shared ? ' is-shared' : ''}${landscapeCover ? ' is-landscape-cover' : ''}`}
       style={{
         width: layout.width,
         height: layout.height,
         '--media-height': `${layout.mediaHeight}px`,
         '--caption-height': `${layout.captionHeight}px`,
-        transform,
-        zIndex: active ? 10 : layout.layer || 1,
+        '--atlas-x': `${layout.x}px`,
+        '--atlas-y': `${layout.y}px`,
+        zIndex: active ? 24 : related ? 16 : shared ? 14 : recent ? 10 : layout.layer || 1,
       }}
       onMouseEnter={() => onHover(reference.key)}
       onMouseLeave={() => onHover('')}
@@ -969,7 +1071,11 @@ function AtlasObject({ reference, layout, active, related, recent, shared, onSel
         aria-label={`${reference.title}, ${reference.creatorsLabel}`}
       >
         <span className="object-media">
-          <ReferenceVisual reference={reference} />
+          <ReferenceVisual
+            reference={reference}
+            overlay={stickers}
+            onImageRatio={(ratio) => onImageRatio(reference.key, ratio)}
+          />
         </span>
       </button>
       <div className="object-caption">
@@ -1017,8 +1123,12 @@ function AtlasViewport({ focalItems, focusItem, viewport, scale, setTransform, c
 
 function MiniMap({ items, layout, activeKey, transformState, viewport, onNavigate }) {
   const compact = viewport.width < 760;
-  const width = compact ? 96 : 150;
-  const height = compact ? 68 : 105;
+  const maxWidth = compact ? 96 : 150;
+  const maxHeight = compact ? 112 : 150;
+  const layoutRatio = layout.width / Math.max(1, layout.height);
+  const availableRatio = maxWidth / maxHeight;
+  const width = Math.round(availableRatio > layoutRatio ? maxHeight * layoutRatio : maxWidth);
+  const height = Math.round(availableRatio > layoutRatio ? maxHeight : maxWidth / layoutRatio);
   const scaleX = width / layout.width;
   const scaleY = height / layout.height;
   const chromeHeight = headerHeight(viewport);
@@ -1104,7 +1214,7 @@ function DetailPanel({ reference, suggestions, onSelect, onClose, suspended }) {
                 title={reference.embed?.title || reference.title}
                 src={embedSrc || undefined}
                 srcDoc={embedSrc ? undefined : embedHtml}
-                sandbox="allow-scripts allow-same-origin allow-popups allow-presentation"
+                sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-presentation"
                 allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
                 allowFullScreen
               />
@@ -1153,22 +1263,22 @@ function DetailPanel({ reference, suggestions, onSelect, onClose, suspended }) {
 
         <div className="detail-actions">
           {href && (
-            <a href={href} target="_blank" rel="noreferrer">
+            <ExternalLink href={href}>
               <ArrowUpRight size={16} />
               <span>{sourceActionLabel(reference)}</span>
-            </a>
+            </ExternalLink>
           )}
           {reference.zoteroUrl && (
-            <a href={reference.zoteroUrl} target="_blank" rel="noreferrer">
+            <ExternalLink href={reference.zoteroUrl}>
               <Library size={16} />
               <span>Zotero</span>
-            </a>
+            </ExternalLink>
           )}
           {reference.archive?.url && (
-            <a href={reference.archive.url} target="_blank" rel="noreferrer">
+            <ExternalLink href={reference.archive.url}>
               <Globe2 size={16} />
               <span>Archive web</span>
-            </a>
+            </ExternalLink>
           )}
         </div>
 
@@ -1206,9 +1316,9 @@ function DetailPanel({ reference, suggestions, onSelect, onClose, suspended }) {
                 <dt>Couverture</dt>
                 <dd className="cover-credit">
                   {reference.cover.sourceUrl ? (
-                    <a href={reference.cover.sourceUrl} target="_blank" rel="noreferrer">
+                    <ExternalLink href={reference.cover.sourceUrl}>
                       {reference.cover.attribution}
-                    </a>
+                    </ExternalLink>
                   ) : reference.cover.attribution}
                   {reference.cover.retrievedAt && <small> · {reference.cover.retrievedAt}</small>}
                 </dd>
@@ -1288,6 +1398,7 @@ export default function App() {
   const [focusReferenceKey, setFocusReferenceKey] = useState('');
   const [transformState, setTransformState] = useState({ scale: 1, positionX: 0, positionY: 0 });
   const [viewport, setViewport] = useState({ width: 1280, height: 720 });
+  const [measuredAssetRatios, setMeasuredAssetRatios] = useState(() => new Map());
   const activeYearRef = useRef('');
 
   useEffect(() => {
@@ -1329,9 +1440,9 @@ export default function App() {
     const syncLocation = async () => {
       const currentRequest = ++requestId;
       const next = readViewParams();
-      const key = referenceKeyFromHash();
+      const hashToken = referenceTokenFromHash();
       const availableYears = new Set(catalogIndex.years.map((year) => year.id));
-      const referenceYears = key ? (catalogIndex.referenceYears?.[key] || []) : [];
+      const referenceYears = referenceYearsForHashToken(catalogIndex, hashToken);
       const requestedYear = availableYears.has(next.year) ? next.year : '';
       const targetYear = requestedYear
         || referenceYears.find((year) => availableYears.has(year))
@@ -1352,9 +1463,7 @@ export default function App() {
         setViewMode(next.view);
         setListSort(next.sort);
 
-        const reference = key
-          ? (payload.references || []).find((candidate) => candidate.key.toUpperCase() === key)
-          : null;
+        const reference = findReferenceByHashToken(payload.references || [], hashToken);
         setSelectedReference(reference || null);
         writeViewParams(next.view, next.sort, targetYear, catalogIndex.defaultYear, 'replace');
         if (reference) {
@@ -1365,7 +1474,7 @@ export default function App() {
             'replace',
             Boolean(window.history.state?.zotscapeDetailEntry),
           );
-        } else if (key) {
+        } else if (hashToken) {
           writeReferenceHash(null, targetYear, catalogIndex.defaultYear, 'replace', false);
         }
       } catch (loadError) {
@@ -1388,9 +1497,9 @@ export default function App() {
 
   useEffect(() => {
     if (!catalog) return;
-    const key = referenceKeyFromHash();
-    if (!key) return;
-    const reference = references.find((candidate) => candidate.key.toUpperCase() === key);
+    const hashToken = referenceTokenFromHash();
+    if (!hashToken) return;
+    const reference = findReferenceByHashToken(references, hashToken);
     if (reference) setSelectedReference(reference);
   }, [catalog, references]);
 
@@ -1423,8 +1532,8 @@ export default function App() {
     [filteredReferences, listSort],
   );
   const packed = useMemo(
-    () => packReferences(filteredReferences, viewport, recentKeys, sharedKeys, sharedOnly),
-    [filteredReferences, recentKeys, sharedKeys, sharedOnly, viewport],
+    () => packReferences(filteredReferences, viewport, recentKeys, sharedKeys, sharedOnly, measuredAssetRatios),
+    [filteredReferences, measuredAssetRatios, recentKeys, sharedKeys, sharedOnly, viewport],
   );
   const visibleItems = packed.items;
   const layout = packed.layout || catalog?.layout || DEFAULT_LAYOUT;
@@ -1436,12 +1545,6 @@ export default function App() {
     () => visibleItems.filter(({ reference }) => sharedKeys.has(reference.key)),
     [sharedKeys, visibleItems],
   );
-  const meetingItems = useMemo(
-    () => sharedOnly
-      ? visibleSharedItems
-      : visibleSharedItems.filter(({ reference }) => !recentKeys.has(reference.key)),
-    [recentKeys, sharedOnly, visibleSharedItems],
-  );
   const focalItems = useMemo(
     () => sharedOnly
       ? visibleSharedItems
@@ -1449,8 +1552,6 @@ export default function App() {
     [sharedOnly, visibleItems, visibleRecentItems, visibleSharedItems],
   );
   const focalBounds = useMemo(() => itemBounds(focalItems), [focalItems]);
-  const recentBounds = useMemo(() => itemBounds(visibleRecentItems), [visibleRecentItems]);
-  const meetingBounds = useMemo(() => itemBounds(meetingItems), [meetingItems]);
   const fixedScale = useMemo(() => {
     const compact = viewport.width < 760;
     const preferredScale = compact ? 0.68 : 0.9;
@@ -1469,9 +1570,14 @@ export default function App() {
   }, [focalBounds, viewport]);
 
   const activeReference = selectedReference || references.find((reference) => reference.key === hoveredKey) || null;
-  const relatedKeys = useMemo(() => new Set(selectedReference
-    ? filteredReferences.filter((reference) => reference.key !== selectedReference.key && sharesMemoir(selectedReference, reference)).map((reference) => reference.key)
-    : []), [filteredReferences, selectedReference]);
+  const relatedKeys = useMemo(() => {
+    if (!activeReference) return new Set();
+    return new Set(
+      filteredReferences
+        .filter((reference) => reference.key !== activeReference.key && sharesMemoir(activeReference, reference))
+        .map((reference) => reference.key),
+    );
+  }, [activeReference, filteredReferences]);
   const allTypeOptions = useMemo(() => typeOptions(references), [references]);
   const allYearOptions = useMemo(() => yearOptions(references), [references]);
   const suggestions = useMemo(
@@ -1534,6 +1640,17 @@ export default function App() {
     setTypeFilter('');
     setYearFilter('');
     setFeatureFilters(new Set());
+  }
+
+  function recordAssetRatio(referenceKey, ratio) {
+    if (!referenceKey || !Number.isFinite(ratio) || ratio <= 0) return;
+    setMeasuredAssetRatios((current) => {
+      const previous = Number(current.get(referenceKey) || 0);
+      if (Math.abs(previous - ratio) < 0.01) return current;
+      const next = new Map(current);
+      next.set(referenceKey, ratio);
+      return next;
+    });
   }
 
   function changeViewMode(nextView) {
@@ -1603,14 +1720,6 @@ export default function App() {
   function openAbout() {
     setToolsOpen(false);
     setAboutOpen(true);
-  }
-
-  function activateMeetingPoints() {
-    setFeatureFilters((current) => {
-      const next = new Set(current);
-      next.add('shared');
-      return next;
-    });
   }
 
   function discoverReference() {
@@ -1722,24 +1831,6 @@ export default function App() {
                     />
                     <TransformComponent wrapperClass="atlas-wrapper" contentClass="atlas-content">
                       <section className="atlas-surface" style={{ width: layout.width, height: layout.height }} aria-label="Table de références">
-                        {!sharedOnly && recentBounds && (
-                          <p
-                            className="atlas-recent-label"
-                            style={{ transform: `translate(${recentBounds.left}px, ${Math.max(18, recentBounds.top - 38)}px)` }}
-                          >
-                            Derniers ajouts
-                          </p>
-                        )}
-                        {meetingBounds && (
-                          <button
-                            className="atlas-meeting-label"
-                            type="button"
-                            onClick={activateMeetingPoints}
-                            style={{ transform: `translate(${meetingBounds.left}px, ${Math.max(18, meetingBounds.top - 42)}px)` }}
-                          >
-                            Points de rencontre <span>{visibleSharedItems.length}</span>
-                          </button>
-                        )}
                         {visibleItems.map(({ reference, layout: itemLayout }) => (
                           <AtlasObject
                             key={reference.key}
@@ -1751,6 +1842,7 @@ export default function App() {
                             shared={sharedKeys.has(reference.key)}
                             onSelect={openReference}
                             onHover={setHoveredKey}
+                            onImageRatio={recordAssetRatio}
                           />
                         ))}
                       </section>
@@ -1766,6 +1858,7 @@ export default function App() {
             sort={listSort}
             onSortChange={changeListSort}
             recentKeys={recentKeys}
+            sharedKeys={sharedKeys}
             selectedReference={selectedReference}
             onSelect={openReference}
             onDiscover={discoverReference}

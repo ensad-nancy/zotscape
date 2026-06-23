@@ -346,7 +346,6 @@ p {
 }
 
 .mini-map-board:focus-visible,
-.atlas-meeting-label:focus-visible,
 .list-discover:focus-visible,
 .memoir-filter button:focus-visible,
 .detail-suggestions button:focus-visible {
@@ -415,78 +414,30 @@ p {
   background: transparent;
 }
 
-.atlas-recent-label {
-  position: absolute;
-  top: 0;
-  left: 0;
-  z-index: 8;
-  width: fit-content;
-  padding: 4px 7px;
-  color: var(--ink);
-  background: var(--highlight);
-  font-size: 12px;
-  font-weight: 900;
-  line-height: 1;
-  pointer-events: none;
-}
-
-.atlas-meeting-label {
-  position: absolute;
-  top: 0;
-  left: 0;
-  z-index: 8;
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  padding: 4px 7px;
-  color: var(--ink);
-  background: #bde7d8;
-  border: 0;
-  border-radius: 2px;
-  cursor: pointer;
-  font-size: 12px;
-  font-weight: 900;
-  line-height: 1;
-}
-
-.atlas-meeting-label span {
-  display: grid;
-  min-width: 17px;
-  height: 17px;
-  place-items: center;
-  padding: 0 4px;
-  background: rgba(255, 255, 255, 0.58);
-  border-radius: 50%;
-  font-size: 9px;
-}
-
 .atlas-object {
+  --lift-y: 0px;
+  --lift-scale: 1;
   position: absolute;
   top: 0;
   left: 0;
   display: grid;
   grid-template-rows: var(--media-height) var(--caption-height);
   gap: 10px;
-  transform-origin: center;
-  transition: filter 160ms ease, opacity 160ms ease, transform 160ms ease;
+  transform: translate(var(--atlas-x), var(--atlas-y)) translateY(var(--lift-y)) scale(var(--lift-scale));
+  transform-origin: center bottom;
+  transition: filter 180ms ease, opacity 180ms ease, transform 260ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .atlas-object.is-related {
-  filter: saturate(1.18) contrast(1.02);
-}
-
-.atlas-object.is-shared .object-caption p::after {
-  content: "";
-  display: inline-block;
-  width: 18px;
-  height: 7px;
-  margin-left: 6px;
-  background: #8dd1b9;
-  transform: rotate(-2deg);
+  --lift-y: -6px;
+  --lift-scale: 1.006;
+  filter: saturate(1.08) contrast(1.01);
 }
 
 .atlas-object.is-active {
-  filter: saturate(1.35) contrast(1.04);
+  --lift-y: -10px;
+  --lift-scale: 1.01;
+  filter: saturate(1.16) contrast(1.02);
 }
 
 .atlas-object:hover {
@@ -495,6 +446,7 @@ p {
 
 .atlas-object-main {
   position: relative;
+  isolation: isolate;
   display: grid;
   width: 100%;
   height: var(--media-height);
@@ -503,10 +455,12 @@ p {
   background: transparent;
   border: 0;
   cursor: pointer;
+  transition: filter 260ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .object-media {
   position: relative;
+  z-index: 1;
   display: grid;
   place-items: center;
   width: 100%;
@@ -517,6 +471,46 @@ p {
   box-shadow: none;
   overflow: visible;
   isolation: isolate;
+}
+
+.object-stickers {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  pointer-events: none;
+}
+
+.object-sticker {
+  display: inline-flex;
+  min-width: 24px;
+  min-height: 24px;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 6px 3px;
+  color: var(--ink);
+  background: var(--highlight);
+  border-radius: 2px;
+  box-shadow:
+    0 6px 10px rgba(17, 18, 15, 0.18),
+    inset 0 -1px 0 rgba(17, 18, 15, 0.08);
+  font-size: 11px;
+  font-weight: 950;
+  line-height: 1;
+  letter-spacing: -0.02em;
+  text-transform: none;
+  transform: rotate(-5deg);
+}
+
+.object-sticker--shared {
+  padding: 3px 5px;
+  background: #fbfbf5;
+  border-radius: 999px;
+  font-size: 15px;
+  transform: rotate(7deg);
 }
 
 .atlas-object--book .object-media,
@@ -536,9 +530,18 @@ p {
 .atlas-object--cover.atlas-object--chapter .object-media,
 .atlas-object--cover.atlas-object--thesis .object-media {
   background: transparent;
-  box-shadow:
-    0 22px 34px rgba(17, 18, 15, 0.14),
-    0 7px 14px rgba(17, 18, 15, 0.08);
+  box-shadow: none;
+}
+
+.atlas-object.is-landscape-cover .object-media {
+  border-radius: 4px;
+  background: transparent;
+  box-shadow: none;
+}
+
+.atlas-object.is-landscape-cover .object-media::before,
+.atlas-object.is-landscape-cover .object-media::after {
+  content: none;
 }
 
 .atlas-object--cover.atlas-object--book .object-media::after,
@@ -631,29 +634,41 @@ p {
     inset 0 0 0 1px rgba(17, 18, 15, 0.05);
 }
 
+.atlas-object--open-graph.atlas-object--article .object-media,
+.atlas-object--open-graph.atlas-object--document .object-media,
+.atlas-object--archive.atlas-object--article .object-media,
+.atlas-object--archive.atlas-object--document .object-media,
+.atlas-object--screenshot.atlas-object--article .object-media,
+.atlas-object--screenshot.atlas-object--document .object-media,
+.atlas-object--pdf-screenshot.atlas-object--article .object-media,
+.atlas-object--pdf-screenshot.atlas-object--document .object-media,
+.atlas-object--oembed.atlas-object--article .object-media,
+.atlas-object--oembed.atlas-object--document .object-media {
+  border-radius: 4px;
+  background: transparent;
+  box-shadow: none;
+}
+
+.atlas-object--open-graph.atlas-object--article .object-media::after,
+.atlas-object--open-graph.atlas-object--document .object-media::after,
+.atlas-object--archive.atlas-object--article .object-media::after,
+.atlas-object--archive.atlas-object--document .object-media::after,
+.atlas-object--screenshot.atlas-object--article .object-media::after,
+.atlas-object--screenshot.atlas-object--document .object-media::after,
+.atlas-object--pdf-screenshot.atlas-object--article .object-media::after,
+.atlas-object--pdf-screenshot.atlas-object--document .object-media::after,
+.atlas-object--oembed.atlas-object--article .object-media::after,
+.atlas-object--oembed.atlas-object--document .object-media::after {
+  content: none;
+}
+
 .atlas-object--web .object-media {
-  border-radius: 10px;
-  background: #fbfbf5;
-  box-shadow:
-    0 18px 34px rgba(17, 18, 15, 0.14),
-    inset 0 0 0 1px rgba(17, 18, 15, 0.06);
+  background: transparent;
+  box-shadow: none;
 }
 
 .atlas-object--web .object-media::before {
-  content: "";
-  position: absolute;
-  top: 10px;
-  left: 10px;
-  right: 10px;
-  height: 18px;
-  z-index: 2;
-  background:
-    radial-gradient(circle at 10px 50%, rgba(255, 123, 89, 0.84) 0 3px, transparent 3.5px),
-    radial-gradient(circle at 22px 50%, rgba(241, 232, 77, 0.92) 0 3px, transparent 3.5px),
-    radial-gradient(circle at 34px 50%, rgba(167, 223, 112, 0.88) 0 3px, transparent 3.5px),
-    rgba(17, 18, 15, 0.08);
-  border-radius: 999px;
-  pointer-events: none;
+  content: none;
 }
 
 .atlas-object--film .object-media {
@@ -773,6 +788,16 @@ p {
   overflow-wrap: anywhere;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 4;
+}
+
+.dom-fallback--web {
+  align-content: center;
+  gap: 12px;
+}
+
+.dom-fallback--web strong {
+  font-size: clamp(18px, 6.5cqw, 29px);
+  -webkit-line-clamp: 5;
 }
 
 .dom-fallback-authors {
@@ -909,7 +934,28 @@ p {
   border-radius: 8px 8px 0 0;
 }
 
-.object-media img,
+.object-visual-shell {
+  position: relative;
+  z-index: 1;
+  display: block;
+  box-sizing: border-box;
+  max-width: calc(100% - 28px);
+  max-height: calc(var(--media-height) - 28px);
+  line-height: 0;
+}
+
+.object-visual-shell > img {
+  display: block;
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: inherit;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  object-fit: contain;
+}
+
 .object-media iframe {
   position: absolute;
   inset: 14px;
@@ -925,66 +971,130 @@ p {
   object-fit: contain;
 }
 
-.atlas-object--article .object-media img,
-.atlas-object--article .object-media iframe,
-.atlas-object--document .object-media img,
-.atlas-object--document .object-media iframe {
-  inset: 8px;
-  width: auto;
-  height: auto;
+.atlas-object--article .object-visual-shell,
+.atlas-object--document .object-visual-shell {
   max-width: calc(100% - 16px);
-  max-height: calc(100% - 16px);
+  max-height: calc(var(--media-height) - 16px);
 }
 
-.atlas-object--web .object-media img,
-.atlas-object--web .object-media iframe {
-  inset: 34px 8px 8px;
-  width: auto;
-  height: auto;
-  max-width: calc(100% - 16px);
-  max-height: calc(100% - 42px);
+.atlas-object--open-graph.atlas-object--article .object-visual-shell,
+.atlas-object--open-graph.atlas-object--document .object-visual-shell,
+.atlas-object--archive.atlas-object--article .object-visual-shell,
+.atlas-object--archive.atlas-object--document .object-visual-shell,
+.atlas-object--screenshot.atlas-object--article .object-visual-shell,
+.atlas-object--screenshot.atlas-object--document .object-visual-shell,
+.atlas-object--pdf-screenshot.atlas-object--article .object-visual-shell,
+.atlas-object--pdf-screenshot.atlas-object--document .object-visual-shell,
+.atlas-object--oembed.atlas-object--article .object-visual-shell,
+.atlas-object--oembed.atlas-object--document .object-visual-shell,
+.atlas-object--cover .object-visual-shell {
+  width: 100%;
+  height: var(--media-height);
+  max-width: 100%;
+  max-height: var(--media-height);
 }
 
-.atlas-object--film .object-media img,
-.atlas-object--film .object-media iframe {
-  inset: 22px 14px;
-  width: auto;
-  height: auto;
+.atlas-object--web .object-visual-shell {
+  width: 100%;
+  max-width: 100%;
+  max-height: var(--media-height);
+}
+
+.atlas-object--film .object-visual-shell {
   max-width: calc(100% - 28px);
-  max-height: calc(100% - 44px);
+  max-height: calc(var(--media-height) - 44px);
 }
 
-.atlas-object--screenshot .object-media img,
-.atlas-object--open-graph .object-media img,
-.atlas-object--oembed .object-media img,
-.atlas-object--archive .object-media img,
-.atlas-object--pdf-screenshot .object-media img {
+.object-visual-shell--web {
+  display: grid;
+  place-items: end center;
+  padding: 26px 8px 8px;
+  background: #fbfbf5;
+  border-radius: 10px;
+  box-shadow:
+    0 14px 24px rgba(17, 18, 15, 0.12),
+    inset 0 0 0 1px rgba(17, 18, 15, 0.06);
+}
+
+.object-visual-shell--web::before {
+  content: "";
+  position: absolute;
+  top: 9px;
+  left: 8px;
+  right: 8px;
+  height: 12px;
+  z-index: 2;
+  background:
+    radial-gradient(circle at 8px 50%, rgba(255, 123, 89, 0.84) 0 2.5px, transparent 3px),
+    radial-gradient(circle at 19px 50%, rgba(241, 232, 77, 0.92) 0 2.5px, transparent 3px),
+    radial-gradient(circle at 30px 50%, rgba(167, 223, 112, 0.88) 0 2.5px, transparent 3px),
+    linear-gradient(90deg, rgba(17, 18, 15, 0.08), rgba(17, 18, 15, 0.05));
+  border-radius: 999px;
+  pointer-events: none;
+}
+
+.object-visual-shell--web > img {
+  width: 100%;
+  height: auto;
+  max-height: calc(var(--media-height) - 34px);
+  border-radius: 2px;
+  filter: none;
+}
+
+.object-visual-shell--web .object-stickers {
+  top: 30px;
+  left: 10px;
+}
+
+.atlas-object--screenshot .object-visual-shell > img,
+.atlas-object--open-graph .object-visual-shell > img,
+.atlas-object--oembed .object-visual-shell > img,
+.atlas-object--archive .object-visual-shell > img,
+.atlas-object--pdf-screenshot .object-visual-shell > img {
   background: transparent;
 }
 
-.atlas-object--cover .object-media img,
-.atlas-object--fallback .object-media img {
-  inset: 0;
+.atlas-object--open-graph.atlas-object--article .object-visual-shell > img,
+.atlas-object--open-graph.atlas-object--document .object-visual-shell > img,
+.atlas-object--archive.atlas-object--article .object-visual-shell > img,
+.atlas-object--archive.atlas-object--document .object-visual-shell > img,
+.atlas-object--screenshot.atlas-object--article .object-visual-shell > img,
+.atlas-object--screenshot.atlas-object--document .object-visual-shell > img,
+.atlas-object--pdf-screenshot.atlas-object--article .object-visual-shell > img,
+.atlas-object--pdf-screenshot.atlas-object--document .object-visual-shell > img,
+.atlas-object--oembed.atlas-object--article .object-visual-shell > img,
+.atlas-object--oembed.atlas-object--document .object-visual-shell > img {
   width: 100%;
   height: 100%;
-  max-width: 100%;
-  max-height: 100%;
-  border-radius: 3px 7px 7px 3px;
-  object-fit: contain;
+  border-radius: 4px;
+  filter:
+    drop-shadow(0 17px 18px rgba(17, 18, 15, 0.1))
+    drop-shadow(0 4px 7px rgba(17, 18, 15, 0.08));
 }
 
-.atlas-object.is-active .atlas-object-main::after,
-.atlas-object.is-related .atlas-object-main::after {
-  content: "";
-  position: absolute;
-  left: 8%;
-  right: 8%;
-  bottom: 11%;
-  z-index: 2;
-  height: 16px;
-  background: rgba(241, 232, 77, 0.78);
-  mix-blend-mode: multiply;
-  pointer-events: none;
+.atlas-object--cover .object-visual-shell > img {
+  width: 100%;
+  height: 100%;
+  border-radius: 3px 7px 7px 3px;
+  filter:
+    drop-shadow(0 18px 20px rgba(17, 18, 15, 0.14))
+    drop-shadow(0 5px 9px rgba(17, 18, 15, 0.08));
+}
+
+.atlas-object.is-landscape-cover .object-visual-shell > img {
+  border-radius: 4px;
+}
+
+.atlas-object.is-related .atlas-object-main {
+  filter:
+    drop-shadow(9px 10px 8px rgba(17, 18, 15, 0.13))
+    drop-shadow(3px 3px 3px rgba(17, 18, 15, 0.08));
+}
+
+.atlas-object.is-active .atlas-object-main {
+  filter:
+    drop-shadow(13px 14px 10px rgba(17, 18, 15, 0.18))
+    drop-shadow(4px 4px 4px rgba(17, 18, 15, 0.1));
 }
 
 .object-caption {
@@ -1165,6 +1275,7 @@ p {
 }
 
 .reference-list-visual {
+  --media-height: 108px;
   display: grid;
   width: 128px;
   height: 108px;
@@ -1172,12 +1283,44 @@ p {
   overflow: visible;
 }
 
+.reference-list-visual .object-visual-shell {
+  position: relative;
+  display: block;
+  max-width: 100%;
+  max-height: var(--media-height);
+  line-height: 0;
+}
+
+.reference-list-visual .object-visual-shell--web {
+  padding: 15px 4px 4px;
+  border-radius: 6px;
+  box-shadow:
+    0 8px 12px rgba(17, 18, 15, 0.1),
+    inset 0 0 0 1px rgba(17, 18, 15, 0.06);
+}
+
+.reference-list-visual .object-visual-shell--web::before {
+  top: 5px;
+  left: 4px;
+  right: 4px;
+  height: 7px;
+  background:
+    radial-gradient(circle at 5px 50%, rgba(255, 123, 89, 0.84) 0 1.5px, transparent 2px),
+    radial-gradient(circle at 12px 50%, rgba(241, 232, 77, 0.92) 0 1.5px, transparent 2px),
+    radial-gradient(circle at 19px 50%, rgba(167, 223, 112, 0.88) 0 1.5px, transparent 2px),
+    linear-gradient(90deg, rgba(17, 18, 15, 0.08), rgba(17, 18, 15, 0.05));
+}
+
+.reference-list-visual .object-visual-shell--web > img {
+  max-height: calc(var(--media-height) - 19px);
+}
+
 .reference-list-visual img {
   display: block;
   width: auto;
   max-width: 100%;
   height: auto;
-  max-height: 100%;
+  max-height: var(--media-height);
   object-fit: contain;
   filter: drop-shadow(0 8px 12px rgba(17, 18, 15, 0.12));
 }
@@ -1188,7 +1331,63 @@ p {
   max-width: 82px;
 }
 
+.reference-list-visual--book .object-visual-shell,
+.reference-list-visual--chapter .object-visual-shell,
+.reference-list-visual--thesis .object-visual-shell {
+  max-width: 82px;
+}
+
+.reference-list-visual .dom-fallback {
+  position: relative;
+  inset: auto;
+  width: 82px;
+  height: 106px;
+  gap: 7px;
+  padding: 10px;
+  box-shadow: 0 8px 14px rgba(17, 18, 15, 0.12);
+}
+
+.reference-list-visual .dom-fallback--film,
+.reference-list-visual .dom-fallback--web,
+.reference-list-visual .dom-fallback--article,
+.reference-list-visual .dom-fallback--document {
+  width: 124px;
+  height: 82px;
+}
+
+.reference-list-visual .dom-fallback--web {
+  padding-top: 22px;
+}
+
+.reference-list-visual .dom-fallback--web::before {
+  top: 5px;
+  left: 6px;
+  right: 6px;
+  height: 9px;
+}
+
+.reference-list-visual .dom-fallback strong,
+.reference-list-visual .dom-fallback-authors,
+.reference-list-visual .dom-fallback em {
+  display: none;
+}
+
+.reference-list-visual .dom-fallback-kicker {
+  padding-top: 5px;
+  border-top-width: 4px;
+  font-size: 9px;
+}
+
+.reference-list-stickers {
+  top: 3px;
+  left: 3px;
+  gap: 3px;
+  transform: scale(0.78);
+  transform-origin: top left;
+}
+
 .list-fallback {
+  position: relative;
   display: grid;
   width: 82px;
   height: 106px;
@@ -1198,6 +1397,7 @@ p {
   background: var(--fallback-paper);
   border-left: 8px solid color-mix(in srgb, var(--fallback-ink) 12%, transparent);
   box-shadow: 0 8px 14px rgba(17, 18, 15, 0.12);
+  overflow: visible;
 }
 
 .list-fallback--film,
@@ -1209,7 +1409,7 @@ p {
   border-left-width: 4px;
 }
 
-.list-fallback span {
+.list-fallback > span:not(.object-stickers) {
   font-size: 9px;
   font-weight: 950;
   text-transform: uppercase;
@@ -1857,10 +2057,16 @@ p {
 }
 
 .suggestion-visual {
+  --media-height: 60px;
   display: grid;
   width: 54px;
   height: 60px;
   place-items: center;
+}
+
+.suggestion-visual .object-visual-shell {
+  max-width: 100%;
+  max-height: 100%;
 }
 
 .suggestion-visual img {
@@ -1873,23 +2079,31 @@ p {
   filter: drop-shadow(0 5px 8px rgba(17, 18, 15, 0.12));
 }
 
-.suggestion-visual .list-fallback {
+.suggestion-visual .dom-fallback {
+  position: relative;
+  inset: auto;
   width: 38px;
   height: 52px;
-  padding: 4px;
-  border-left-width: 4px;
+  padding: 5px;
 }
 
-.suggestion-visual--film .list-fallback,
-.suggestion-visual--web .list-fallback,
-.suggestion-visual--article .list-fallback,
-.suggestion-visual--document .list-fallback {
+.suggestion-visual--film .dom-fallback,
+.suggestion-visual--web .dom-fallback,
+.suggestion-visual--article .dom-fallback,
+.suggestion-visual--document .dom-fallback {
   width: 52px;
   height: 36px;
-  border-left-width: 2px;
 }
 
-.suggestion-visual .list-fallback span {
+.suggestion-visual .dom-fallback strong,
+.suggestion-visual .dom-fallback-authors,
+.suggestion-visual .dom-fallback em {
+  display: none;
+}
+
+.suggestion-visual .dom-fallback-kicker {
+  padding-top: 3px;
+  border-top-width: 3px;
   font-size: 6px;
 }
 
@@ -2065,6 +2279,14 @@ p {
   font-weight: 850;
 }
 
+@media (prefers-reduced-motion: reduce) {
+  .atlas-object {
+    --lift-y: 0px;
+    --lift-scale: 1;
+    transition: filter 120ms ease, opacity 120ms ease;
+  }
+}
+
 @media (max-width: 760px) {
   :root {
     --header-height: 74px;
@@ -2204,6 +2426,7 @@ p {
   }
 
   .reference-list-visual {
+    --media-height: 82px;
     width: 72px;
     height: 82px;
   }
@@ -2212,6 +2435,30 @@ p {
   .reference-list-visual--chapter img,
   .reference-list-visual--thesis img {
     max-width: 58px;
+  }
+
+  .reference-list-visual--book .object-visual-shell,
+  .reference-list-visual--chapter .object-visual-shell,
+  .reference-list-visual--thesis .object-visual-shell {
+    max-width: 58px;
+  }
+
+  .reference-list-visual .object-visual-shell--web > img {
+    max-height: calc(82px - 18px);
+  }
+
+  .reference-list-visual .dom-fallback {
+    width: 58px;
+    height: 80px;
+    padding: 7px;
+  }
+
+  .reference-list-visual .dom-fallback--film,
+  .reference-list-visual .dom-fallback--web,
+  .reference-list-visual .dom-fallback--article,
+  .reference-list-visual .dom-fallback--document {
+    width: 70px;
+    height: 58px;
   }
 
   .list-fallback {

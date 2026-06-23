@@ -33,6 +33,8 @@ GOOGLE_BOOKS_API_KEY=
 ISBNDB_API_KEY=
 ```
 
+La collecte parallélise les pages Zotero, les enrichissements médias et les captures avec des limites prudentes adaptées à GitHub Actions. Elle conserve aussi un cache Zotero versionné dans `.cache/` et le met à jour via les changements depuis la dernière version connue. Les réglages optionnels sont documentés dans `.env.example` (`ZOTSCAPE_ENRICH_CONCURRENCY`, `ZOTSCAPE_ZOTERO_PAGE_CONCURRENCY`, `ZOTSCAPE_SCREENSHOT_CONCURRENCY`, `ZOTSCAPE_WEB_CACHE_TTL_HOURS`, etc.).
+
 ## Déploiement
 
 GitHub Actions collecte les données, restaure le cache des enrichissements, construit l’application et la publie sur GitHub Pages à chaque push sur `main` et une fois par jour.

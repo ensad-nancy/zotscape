@@ -17,6 +17,7 @@ const screenshotDir = path.join(mediaDir, 'screenshots');
 const fallbackDir = path.join(mediaDir, 'fallbacks');
 const cacheDir = path.join(projectRoot, '.cache');
 const assetCacheFile = path.join(cacheDir, 'zotscape-assets.json');
+const zoteroCacheFile = path.join(cacheDir, 'zotscape-zotero.json');
 const execFileAsync = promisify(execFile);
 
 function parseEnvLine(line) {
@@ -56,6 +57,13 @@ const USE_PUBLIC_GOOGLE_BOOKS = process.env.ZOTSCAPE_ENABLE_GOOGLE_BOOKS_PUBLIC 
 const ISBNDB_API_KEY = process.env.ISBNDB_API_KEY || '';
 const COVER_PIPELINE_VERSION = 4;
 const COVER_FAILURE_CACHE_MS = 20 * 60 * 60 * 1000;
+const WEB_CACHE_TTL_MS = envInteger('ZOTSCAPE_WEB_CACHE_TTL_HOURS', 168, 0, 24 * 365) * 60 * 60 * 1000;
+const MAX_WEB_CACHE_HTML_CHARS = envInteger('ZOTSCAPE_WEB_CACHE_HTML_CHARS', 350_000, 0, 2_000_000);
+const VALIDATE_CACHE_ASSETS = process.env.ZOTSCAPE_VALIDATE_CACHE_ASSETS === '1';
+const ZOTERO_PAGE_CONCURRENCY = envInteger('ZOTSCAPE_ZOTERO_PAGE_CONCURRENCY', 2, 1, 6);
+const ENRICH_CONCURRENCY = envInteger('ZOTSCAPE_ENRICH_CONCURRENCY', 4, 1, 10);
+const SCREENSHOT_CONCURRENCY = envInteger('ZOTSCAPE_SCREENSHOT_CONCURRENCY', 2, 1, 4);
+const SCREENSHOT_ATTEMPT_LIMIT = envInteger('ZOTSCAPE_SCREENSHOT_ATTEMPT_LIMIT', 36, 0, 200);
 const MAX_PUBLIC_PDF_BYTES = 50 * 1024 * 1024;
 const ATLAS_WIDTH = 3200;
 const ATLAS_HEIGHT = 2200;
@@ -156,6 +164,26 @@ function log(message) {
   process.stdout.write(`${message}\n`);
 }
 
+function envInteger(name, fallback, min = 0, max = Number.MAX_SAFE_INTEGER) {
+  const value = Number(process.env[name]);
+  if (!Number.isFinite(value)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(value)));
+}
+
+function formatDuration(ms) {
+  if (ms < 1000) return `${ms}ms`;
+  const seconds = ms / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+}
+
+async function timed(label, callback) {
+  const startedAt = Date.now();
+  const result = await callback();
+  log(`${label} in ${formatDuration(Date.now() - startedAt)}.`);
+  return result;
+}
+
 async function readJson(filePath, fallback) {
   try {
     return JSON.parse(await fs.readFile(filePath, 'utf8'));
@@ -169,14 +197,77 @@ async function writeJson(filePath, payload) {
   await fs.writeFile(filePath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
 }
 
+async function writeTextIfChanged(filePath, text) {
+  const current = await fs.readFile(filePath, 'utf8').catch(() => null);
+  if (current === text) return;
+  await fs.writeFile(filePath, text, 'utf8');
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function mapLimit(items, limit, mapper) {
+  const entries = Array.from(items);
+  if (!entries.length) return [];
+  const results = new Array(entries.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(1, limit), entries.length);
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (nextIndex < entries.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(entries[index], index);
+    }
+  }));
+  return results;
+}
+
+function isCacheFresh(checkedAt, ttlMs = WEB_CACHE_TTL_MS) {
+  if (!ttlMs) return false;
+  const time = Date.parse(checkedAt || '');
+  return Number.isFinite(time) && Date.now() - time < ttlMs;
+}
+
+function parseRetryAfter(value) {
+  const text = String(value || '').trim();
+  if (!text) return 0;
+  const seconds = Number(text);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const date = Date.parse(text);
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : 0;
+}
+
+const hostCooldowns = new Map();
+
+function hostForUrl(url) {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+async function waitForHostCooldown(url) {
+  const host = hostForUrl(url);
+  if (!host) return;
+  const resumeAt = hostCooldowns.get(host) || 0;
+  const delay = resumeAt - Date.now();
+  if (delay > 0) await sleep(Math.min(delay, 30_000));
+}
+
+function setHostCooldown(url, delayMs) {
+  const host = hostForUrl(url);
+  if (!host || delayMs <= 0) return;
+  const resumeAt = Date.now() + Math.min(delayMs, 60_000);
+  hostCooldowns.set(host, Math.max(hostCooldowns.get(host) || 0, resumeAt));
 }
 
 async function fetchWithRetry(url, options = {}, attempts = 3) {
   let lastError = null;
   for (let index = 0; index < attempts; index += 1) {
     try {
+      await waitForHostCooldown(url);
       const response = await fetch(url, {
         ...options,
         headers: {
@@ -184,19 +275,27 @@ async function fetchWithRetry(url, options = {}, attempts = 3) {
           ...(options.headers || {}),
         },
       });
-      const backoff = Number(response.headers.get('Backoff') || 0);
-      if (backoff > 0) {
-        await sleep(Math.min(backoff * 1000, 15_000));
+      const backoffSeconds = Number(response.headers.get('Backoff') || 0);
+      const backoffMs = Number.isFinite(backoffSeconds) ? Math.max(0, backoffSeconds) * 1000 : 0;
+      if (backoffMs > 0) {
+        setHostCooldown(url, backoffMs);
+        await sleep(Math.min(backoffMs, 15_000));
       }
       if (response.status === 429 || response.status >= 500) {
         lastError = new Error(`HTTP ${response.status} for ${url}`);
-        await sleep(750 * (index + 1));
+        const retryAfterMs = parseRetryAfter(response.headers.get('Retry-After'));
+        const retryDelayMs = Math.min(
+          30_000,
+          Math.max(retryAfterMs, backoffMs, 750 * (index + 1)) + Math.floor(Math.random() * 250),
+        );
+        setHostCooldown(url, retryDelayMs);
+        await sleep(retryDelayMs);
         continue;
       }
       return response;
     } catch (error) {
       lastError = error;
-      await sleep(750 * (index + 1));
+      await sleep(Math.min(20_000, 750 * (index + 1) + Math.floor(Math.random() * 250)));
     }
   }
   throw lastError || new Error(`Fetch failed for ${url}`);
@@ -229,23 +328,88 @@ async function zoteroPage(pathname, params = {}, start = 0) {
 }
 
 async function zoteroAll(pathname, params = {}) {
-  const all = [];
-  let start = 0;
-  let total = Infinity;
-  let libraryVersion = null;
-  while (start < total) {
-    const page = await zoteroPage(pathname, params, start);
+  const firstPage = await zoteroPage(pathname, params, 0);
+  const all = Array.isArray(firstPage.items) ? [...firstPage.items] : [];
+  const total = firstPage.total || all.length;
+  let libraryVersion = firstPage.libraryVersion || null;
+  if (!all.length || all.length >= total) return { items: all, libraryVersion };
+
+  const starts = [];
+  for (let start = all.length; start < total; start += PAGE_SIZE) {
+    starts.push(start);
+  }
+  const pages = await mapLimit(starts, ZOTERO_PAGE_CONCURRENCY, (start) => zoteroPage(pathname, params, start));
+  for (const page of pages) {
     if (!libraryVersion && page.libraryVersion) {
       libraryVersion = page.libraryVersion;
     }
-    if (!Array.isArray(page.items) || page.items.length === 0) {
-      break;
-    }
-    all.push(...page.items);
-    total = page.total || all.length;
-    start += page.items.length;
+    if (Array.isArray(page.items)) all.push(...page.items);
   }
   return { items: all, libraryVersion };
+}
+
+async function zoteroDeletedSince(libraryVersion) {
+  if (!libraryVersion) return null;
+  const url = new URL(`${zoteroPrefix()}/deleted`);
+  url.searchParams.set('v', '3');
+  url.searchParams.set('since', String(libraryVersion));
+  const response = await fetchWithRetry(url, {
+    headers: { 'Zotero-API-Version': '3' },
+    signal: AbortSignal.timeout(60_000),
+  }, 2);
+  if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    throw new Error(`Zotero /deleted -> ${response.status}: ${body.slice(0, 200)}`);
+  }
+  return {
+    deleted: await response.json(),
+    libraryVersion: response.headers.get('Last-Modified-Version') || null,
+  };
+}
+
+function isUsableZoteroCache(section) {
+  return section
+    && Array.isArray(section.items)
+    && Number.isFinite(Number(section.libraryVersion));
+}
+
+async function zoteroAllCached(cache, cacheKey, pathname, params = {}, deletedField = cacheKey) {
+  const cached = cache[cacheKey];
+  if (!isUsableZoteroCache(cached)) {
+    const result = await zoteroAll(pathname, params);
+    cache[cacheKey] = result;
+    return result;
+  }
+
+  try {
+    const since = Number(cached.libraryVersion);
+    const [changes, deletedResult] = await Promise.all([
+      zoteroAll(pathname, { ...params, since }),
+      zoteroDeletedSince(since),
+    ]);
+    const byKey = new Map(cached.items.filter((item) => item?.key).map((item) => [item.key, item]));
+    for (const item of changes.items || []) {
+      if (item?.key) byKey.set(item.key, item);
+    }
+    const deletedKeys = new Set(deletedResult?.deleted?.[deletedField] || []);
+    for (const key of deletedKeys) byKey.delete(key);
+    const result = {
+      items: [...byKey.values()],
+      libraryVersion: Number(changes.libraryVersion || deletedResult?.libraryVersion || cached.libraryVersion) || cached.libraryVersion,
+    };
+    cache[cacheKey] = result;
+    if ((changes.items || []).length || deletedKeys.size) {
+      log(`Updated Zotero ${cacheKey}: ${changes.items.length} changed, ${deletedKeys.size} deleted.`);
+    } else {
+      log(`Reused Zotero ${cacheKey} cache at version ${result.libraryVersion}.`);
+    }
+    return result;
+  } catch (error) {
+    log(`Zotero ${cacheKey} incremental cache ignored: ${error.message}`);
+    const result = await zoteroAll(pathname, params);
+    cache[cacheKey] = result;
+    return result;
+  }
 }
 
 function normalizeSpace(value) {
@@ -608,6 +772,12 @@ function assetPathExists(asset) {
   return exists(path.join(publicRoot, asset.src));
 }
 
+async function cachedImageAssetUsable(filePath, role = 'preview', options = {}) {
+  if (!await exists(filePath)) return false;
+  if (!VALIDATE_CACHE_ASSETS) return true;
+  return imageLooksUsable(filePath, role, options);
+}
+
 function getDoiUrl(doi) {
   const value = normalizeSpace(doi);
   if (!value) return '';
@@ -717,7 +887,7 @@ async function generateFallbackAsset(reference) {
   <text x="${spec.pad}" y="${spec.yearY}" font-family="Inter, Arial, sans-serif" font-size="18" font-weight="700" fill="${ink}" opacity="0.75">${escapeXml(reference.year || 's. d.')}</text>
 </svg>
 `;
-  await fs.writeFile(filePath, svg, 'utf8');
+  await writeTextIfChanged(filePath, svg);
   return {
     kind: 'fallback',
     src: mediaPath(filePath),
@@ -788,6 +958,22 @@ async function imageDimensions(filePath) {
     height: metadata.height,
     ratio: Number((metadata.width / metadata.height).toFixed(4)),
   };
+}
+
+async function imageAsset(filePath, kind, source, metadata = {}) {
+  return {
+    kind,
+    src: mediaPath(filePath),
+    source,
+    ...metadata,
+    ...await imageDimensions(filePath),
+  };
+}
+
+async function ensureAssetDimensions(asset) {
+  if (!asset?.src || (asset.width && asset.height && asset.ratio)) return asset;
+  const dimensions = await imageDimensions(path.join(publicRoot, asset.src));
+  return Object.keys(dimensions).length ? { ...asset, ...dimensions } : asset;
 }
 
 async function coverAsset(filePath, source, identifier, metadata = {}) {
@@ -1288,7 +1474,7 @@ async function findPageCover(reference, html, assetCache) {
   if (cached?.cacheKey === cacheKey) {
     if (!cached.asset?.src) return null;
     const filePath = path.join(publicRoot, cached.asset.src);
-    if (await exists(filePath) && await imageLooksUsable(filePath, 'cover')) return cached.asset;
+    if (await cachedImageAssetUsable(filePath, 'cover')) return await ensureAssetDimensions(cached.asset);
   }
 
   const candidates = extractPageCoverCandidates(reference, html);
@@ -1472,10 +1658,8 @@ async function enrichCover(reference, assetCache) {
     } else if (cached.asset.src) {
       const filePath = path.join(publicRoot, cached.asset.src);
       const allowLandscapeCover = cached.asset.source === 'inventaire-isbn';
-      if (await exists(filePath) && await imageLooksUsable(filePath, 'cover', { allowLandscapeCover })) {
-        if (!cached.asset.width || !cached.asset.height) {
-          cached.asset = { ...cached.asset, ...await imageDimensions(filePath) };
-        }
+      if (await cachedImageAssetUsable(filePath, 'cover', { allowLandscapeCover })) {
+        cached.asset = await ensureAssetDimensions(cached.asset);
         return cached.asset;
       }
     }
@@ -1525,6 +1709,35 @@ async function fetchHtml(url) {
   };
 }
 
+async function fetchHtmlCached(reference, assetCache) {
+  const url = publicUrl(reference.url);
+  if (!url) return { html: '', status: 0, blocked: false, cached: false };
+  const cacheKey = `${reference.key}:${reference.version}:${url}`;
+  assetCache.webMeta ||= {};
+  const cached = assetCache.webMeta[reference.key];
+  if (cached?.cacheKey === cacheKey && isCacheFresh(cached.checkedAt)) {
+    return {
+      html: cached.html || '',
+      status: cached.status || 0,
+      blocked: Boolean(cached.blocked),
+      cached: true,
+    };
+  }
+  const page = await fetchHtml(url);
+  if (!page.html || page.blocked || page.html.length <= MAX_WEB_CACHE_HTML_CHARS) {
+    assetCache.webMeta[reference.key] = {
+      cacheKey,
+      checkedAt: new Date().toISOString(),
+      status: page.status || 0,
+      blocked: Boolean(page.blocked),
+      html: page.html || '',
+    };
+  } else {
+    delete assetCache.webMeta[reference.key];
+  }
+  return { ...page, cached: false };
+}
+
 function knownOembedEndpoint(url) {
   try {
     const host = new URL(url).hostname.toLowerCase().replace(/^www\./u, '');
@@ -1539,20 +1752,20 @@ function knownOembedEndpoint(url) {
 
 async function downloadPreviewImage(url, reference, type, assetCache, cacheKey) {
   const cached = assetCache.previews?.[`${reference.key}:${type}`];
-  if (cached?.cacheKey === cacheKey && cached.asset?.src && await assetPathExists(cached.asset)) {
-    return cached.asset;
+  if (cached?.cacheKey === cacheKey) {
+    if (cached.asset?.src && await assetPathExists(cached.asset)) {
+      cached.asset = await ensureAssetDimensions(cached.asset);
+      return cached.asset;
+    }
+    if (!cached.asset && isCacheFresh(cached.checkedAt)) return null;
   }
   const imageUrl = publicUrl(String(url || '').replace(/^http:/u, 'https:'));
   if (!imageUrl) return null;
   const filePath = await downloadImage(imageUrl, path.join(previewDir, `${reference.key}-${type}`), { role: 'preview' }).catch(() => null);
   const asset = filePath
-    ? {
-      kind: type,
-      src: mediaPath(filePath),
-      source: imageUrl,
-    }
+    ? await imageAsset(filePath, type, imageUrl)
     : null;
-  assetCache.previews[`${reference.key}:${type}`] = { cacheKey, asset };
+  assetCache.previews[`${reference.key}:${type}`] = { cacheKey, asset, checkedAt: new Date().toISOString() };
   return asset;
 }
 
@@ -1581,12 +1794,18 @@ async function enrichOembed(reference, html, assetCache) {
   if (!url) return null;
   const cacheKey = `${reference.key}:${reference.version}:${url}`;
   const cached = assetCache.embeds?.[reference.key];
-  if (cached?.cacheKey === cacheKey && cached.embed) {
-    if (!cached.embed.thumbnail?.src || await assetPathExists(cached.embed.thumbnail)) return cached.embed;
+  if (cached?.cacheKey === cacheKey) {
+    if (cached.embed) {
+      if (!cached.embed.thumbnail?.src || await assetPathExists(cached.embed.thumbnail)) {
+        if (cached.embed.thumbnail?.src) cached.embed.thumbnail = await ensureAssetDimensions(cached.embed.thumbnail);
+        return cached.embed;
+      }
+    }
+    if (!cached.embed && isCacheFresh(cached.checkedAt)) return null;
   }
   const payload = await fetchOembedPayload(reference, html);
   if (!payload) {
-    assetCache.embeds[reference.key] = { cacheKey, embed: null };
+    assetCache.embeds[reference.key] = { cacheKey, embed: null, checkedAt: new Date().toISOString() };
     return null;
   }
   const thumbnail = await downloadPreviewImage(payload.thumbnail_url, reference, 'oembed', assetCache, `${cacheKey}:${payload.thumbnail_url || ''}`);
@@ -1601,7 +1820,7 @@ async function enrichOembed(reference, html, assetCache) {
     height: Number(payload.height || 0) || null,
     thumbnail,
   };
-  assetCache.embeds[reference.key] = { cacheKey, embed };
+  assetCache.embeds[reference.key] = { cacheKey, embed, checkedAt: new Date().toISOString() };
   return embed;
 }
 
@@ -1611,7 +1830,10 @@ async function enrichOpenGraph(reference, html, assetCache) {
   const cacheKey = `${reference.key}:${reference.version}:${url}`;
   const cached = assetCache.openGraph?.[reference.key];
   if (cached?.cacheKey === cacheKey && cached.openGraph) {
-    if (!cached.openGraph.image?.src || await assetPathExists(cached.openGraph.image)) return cached.openGraph;
+    if (!cached.openGraph.image?.src || await assetPathExists(cached.openGraph.image)) {
+      if (cached.openGraph.image?.src) cached.openGraph.image = await ensureAssetDimensions(cached.openGraph.image);
+      return cached.openGraph;
+    }
   }
   const imageUrl = absoluteUrl(metaContent(html, ['og:image', 'twitter:image', 'twitter:image:src']), url);
   const image = await downloadPreviewImage(imageUrl, reference, 'open-graph', assetCache, `${cacheKey}:${imageUrl || ''}`);
@@ -1622,7 +1844,7 @@ async function enrichOpenGraph(reference, html, assetCache) {
     url: absoluteUrl(metaContent(html, ['og:url']), url) || url,
     image,
   };
-  assetCache.openGraph[reference.key] = { cacheKey, openGraph };
+  assetCache.openGraph[reference.key] = { cacheKey, openGraph, checkedAt: new Date().toISOString() };
   return openGraph;
 }
 
@@ -1631,12 +1853,15 @@ async function findWaybackArchive(reference, assetCache) {
   if (!url) return null;
   const cacheKey = `${reference.key}:${reference.version}:${url}`;
   const cached = assetCache.archives?.[reference.key];
-  if (cached?.cacheKey === cacheKey) return cached.archive || null;
+  if (cached?.cacheKey === cacheKey) {
+    if (cached.archive) return cached.archive;
+    if (isCacheFresh(cached.checkedAt)) return null;
+  }
   const requestUrl = new URL('https://archive.org/wayback/available');
   requestUrl.searchParams.set('url', url);
   const response = await fetchWithRetry(requestUrl, { signal: AbortSignal.timeout(25_000) }, 2).catch(() => null);
   if (!response?.ok) {
-    assetCache.archives[reference.key] = { cacheKey, archive: null };
+    assetCache.archives[reference.key] = { cacheKey, archive: null, checkedAt: new Date().toISOString() };
     return null;
   }
   const payload = await response.json().catch(() => null);
@@ -1649,7 +1874,7 @@ async function findWaybackArchive(reference, assetCache) {
       status: closest.status || '',
     }
     : null;
-  assetCache.archives[reference.key] = { cacheKey, archive };
+  assetCache.archives[reference.key] = { cacheKey, archive, checkedAt: new Date().toISOString() };
   return archive;
 }
 
@@ -1691,9 +1916,12 @@ async function captureScreenshot(reference, tools, assetCache, options = {}) {
   if (cached?.cacheKey === cacheKey) {
     if (cached.asset?.src) {
       const filePath = path.join(publicRoot, cached.asset.src);
-      if (await exists(filePath)) return cached.asset;
+      if (await exists(filePath)) {
+        cached.asset = await ensureAssetDimensions(cached.asset);
+        return cached.asset;
+      }
     }
-    if (cached.failed) return null;
+    if (cached.failed && isCacheFresh(cached.checkedAt)) return null;
   }
 
   const page = await tools.browser.newPage({
@@ -1712,6 +1940,7 @@ async function captureScreenshot(reference, tools, assetCache, options = {}) {
         failed: true,
         blocked: true,
         error: 'blocked page',
+        checkedAt: new Date().toISOString(),
       };
       return null;
     }
@@ -1731,12 +1960,8 @@ async function captureScreenshot(reference, tools, assetCache, options = {}) {
     } else {
       await fs.writeFile(filePath, jpeg);
     }
-    const asset = {
-      kind,
-      src: mediaPath(filePath),
-      source: url,
-    };
-    assetCache.screenshots[cacheId] = { cacheKey, asset };
+    const asset = await imageAsset(filePath, kind, url);
+    assetCache.screenshots[cacheId] = { cacheKey, asset, checkedAt: new Date().toISOString() };
     return asset;
   } catch (error) {
     assetCache.screenshots[cacheId] = {
@@ -1744,11 +1969,66 @@ async function captureScreenshot(reference, tools, assetCache, options = {}) {
       asset: null,
       failed: true,
       error: error.message,
+      checkedAt: new Date().toISOString(),
     };
     return null;
   } finally {
     await page.close().catch(() => {});
   }
+}
+
+async function captureReferencePreview(reference, screenshotTools, assetCache) {
+  if (reference.archive?.url) {
+    const asset = await captureScreenshot(reference, screenshotTools, assetCache, {
+      url: reference.archive.url,
+      kind: 'archive',
+    });
+    if (asset) {
+      reference.archive.asset = asset;
+      return true;
+    }
+  }
+  if (!shouldCaptureVisual(reference)) return false;
+  reference.screenshot = await captureScreenshot(reference, screenshotTools, assetCache);
+  return Boolean(reference.screenshot);
+}
+
+async function capturePreviewFallbacks(candidates, screenshotTools, assetCache) {
+  if (!candidates.length || SCREENSHOT_LIMIT === 0 || SCREENSHOT_ATTEMPT_LIMIT === 0) {
+    return { attempted: 0, captured: 0 };
+  }
+  const maxAttempts = Math.min(candidates.length, SCREENSHOT_ATTEMPT_LIMIT);
+  let nextIndex = 0;
+  let attempted = 0;
+  let inFlight = 0;
+  let captured = 0;
+
+  const claim = () => {
+    if (captured + inFlight >= SCREENSHOT_LIMIT) return null;
+    if (attempted >= maxAttempts) return null;
+    if (nextIndex >= candidates.length) return null;
+    const reference = candidates[nextIndex];
+    nextIndex += 1;
+    attempted += 1;
+    inFlight += 1;
+    return reference;
+  };
+
+  const workers = Array.from({ length: Math.min(SCREENSHOT_CONCURRENCY, maxAttempts) }, async () => {
+    while (true) {
+      const reference = claim();
+      if (!reference) return;
+      try {
+        if (await captureReferencePreview(reference, screenshotTools, assetCache)) captured += 1;
+      } catch (error) {
+        log(`Screenshot failed for ${reference.key}: ${error.message}`);
+      } finally {
+        inFlight -= 1;
+      }
+    }
+  });
+  await Promise.all(workers);
+  return { attempted, captured };
 }
 
 function buildAttachmentSummary(attachments) {
@@ -1896,6 +2176,14 @@ function chooseCardAsset(reference) {
     || reference.archive?.asset
     || reference.screenshot
     || reference.fallback;
+}
+
+async function normalizeReferenceAssets(reference) {
+  if (reference.cover) reference.cover = await ensureAssetDimensions(reference.cover);
+  if (reference.embed?.thumbnail) reference.embed.thumbnail = await ensureAssetDimensions(reference.embed.thumbnail);
+  if (reference.openGraph?.image) reference.openGraph.image = await ensureAssetDimensions(reference.openGraph.image);
+  if (reference.archive?.asset) reference.archive.asset = await ensureAssetDimensions(reference.archive.asset);
+  if (reference.screenshot) reference.screenshot = await ensureAssetDimensions(reference.screenshot);
 }
 
 function shouldCaptureVisual(reference) {
@@ -2104,6 +2392,7 @@ async function main() {
     previews: {},
     archives: {},
     screenshots: {},
+    webMeta: {},
     ...(await readJson(assetCacheFile, {})),
   };
   assetCache.covers ||= {};
@@ -2113,12 +2402,16 @@ async function main() {
   assetCache.previews ||= {};
   assetCache.archives ||= {};
   assetCache.screenshots ||= {};
+  assetCache.webMeta ||= {};
+  const zoteroCache = await readJson(zoteroCacheFile, {});
 
   log(`Collecting Zotero group ${GROUP_ID}...`);
-  const [{ items: collections, libraryVersion: collectionVersion }, { items, libraryVersion: itemVersion }] = await Promise.all([
-    zoteroAll('/collections'),
-    zoteroAll('/items', { include: 'data', includeTrashed: '0' }),
-  ]);
+  const [{ items: collections, libraryVersion: collectionVersion }, { items, libraryVersion: itemVersion }] = await timed('Zotero data loaded', () => (
+    Promise.all([
+      zoteroAllCached(zoteroCache, 'collections', '/collections', {}, 'collections'),
+      zoteroAllCached(zoteroCache, 'items', '/items', { include: 'data', includeTrashed: '0' }, 'items'),
+    ])
+  ));
 
   const activeCollections = collections.filter((collection) => !collection.data?.deleted);
   const yearRoots = activeCollections
@@ -2171,38 +2464,54 @@ async function main() {
   const references = [...uniqueReferenceByKey.values()];
 
   log(`Enriching ${references.length} unique references across ${descriptors.length} year catalog(s).`);
-  log('Enriching covers, embeds, page metadata and fallback cards...');
-  for (const reference of references) {
-    reference.cover = await enrichCover(reference, assetCache);
-    reference.fallback = await generateFallbackAsset(reference);
+  log(`Enriching covers and fallback cards with concurrency=${ENRICH_CONCURRENCY}...`);
+  await timed('Covers and fallback cards enriched', () => mapLimit(references, ENRICH_CONCURRENCY, async (reference) => {
+    try {
+      reference.cover = await enrichCover(reference, assetCache);
+    } catch (error) {
+      reference.cover = null;
+      log(`Cover enrichment failed for ${reference.key}: ${error.message}`);
+    }
+    try {
+      reference.fallback = await generateFallbackAsset(reference);
+    } catch (error) {
+      reference.fallback = null;
+      log(`Fallback generation failed for ${reference.key}: ${error.message}`);
+    }
+  }));
+
+  for (const reference of references.filter((entry) => !entry.url)) {
+    reference.previewStatus = { source: 'fallback', blocked: false, reason: 'no-url' };
   }
 
-  for (const reference of references) {
-    if (!reference.url) {
-      reference.previewStatus = { source: 'fallback', blocked: false, reason: 'no-url' };
-      continue;
-    }
-    const page = await fetchHtml(reference.url);
-    reference.previewStatus = {
-      source: 'pending',
-      blocked: page.blocked,
-      reason: page.blocked ? 'blocked-live-page' : '',
-    };
-    if (!page.blocked && page.html) {
-      if (!reference.cover && COVER_OBJECT_TYPES.has(reference.itemType)) {
-        reference.cover = await findPageCover(reference, page.html, assetCache);
+  const webReferences = references.filter((entry) => entry.url);
+  log(`Enriching page metadata for ${webReferences.length} URL(s) with concurrency=${ENRICH_CONCURRENCY}...`);
+  await timed('Page metadata enriched', () => mapLimit(webReferences, ENRICH_CONCURRENCY, async (reference) => {
+    try {
+      const page = await fetchHtmlCached(reference, assetCache);
+      reference.previewStatus = {
+        source: 'pending',
+        blocked: page.blocked,
+        reason: page.blocked ? 'blocked-live-page' : '',
+      };
+      if (!page.blocked && page.html) {
+        if (!reference.cover && COVER_OBJECT_TYPES.has(reference.itemType)) {
+          reference.cover = await findPageCover(reference, page.html, assetCache);
+        }
+        reference.embed = await enrichOembed(reference, page.html, assetCache);
+        reference.openGraph = await enrichOpenGraph(reference, page.html, assetCache);
       }
-      reference.embed = await enrichOembed(reference, page.html, assetCache);
-      reference.openGraph = await enrichOpenGraph(reference, page.html, assetCache);
+      if (page.blocked || (!reference.cover && !reference.embed?.thumbnail && !reference.openGraph?.image)) {
+        reference.archive = await findWaybackArchive(reference, assetCache);
+      }
+    } catch (error) {
+      reference.previewStatus = { source: 'fallback', blocked: false, reason: 'metadata-error' };
+      log(`Page metadata failed for ${reference.key}: ${error.message}`);
     }
-    if (page.blocked || (!reference.cover && !reference.embed?.thumbnail && !reference.openGraph?.image)) {
-      reference.archive = await findWaybackArchive(reference, assetCache);
-    }
-  }
+  }));
 
   const screenshotTools = await loadScreenshotTools();
   if (screenshotTools) {
-    let captured = 0;
     const captureCandidates = references.filter((reference) => (
       reference.url
       && !COVER_OBJECT_TYPES.has(reference.itemType)
@@ -2210,31 +2519,18 @@ async function main() {
       && !reference.embed?.thumbnail
       && !reference.openGraph?.image
     ));
-    log(`Capturing up to ${SCREENSHOT_LIMIT} final preview fallbacks...`);
-    for (const reference of captureCandidates) {
-      if (captured >= SCREENSHOT_LIMIT) break;
-      if (reference.archive?.url) {
-        const asset = await captureScreenshot(reference, screenshotTools, assetCache, {
-          url: reference.archive.url,
-          kind: 'archive',
-        });
-        if (asset) {
-          reference.archive.asset = asset;
-          captured += 1;
-          continue;
-        }
-      }
-      if (shouldCaptureVisual(reference)) {
-        reference.screenshot = await captureScreenshot(reference, screenshotTools, assetCache);
-        if (reference.screenshot) captured += 1;
-      }
-    }
+    log(`Capturing up to ${SCREENSHOT_LIMIT} final preview fallback(s), ${SCREENSHOT_ATTEMPT_LIMIT} attempt(s), concurrency=${SCREENSHOT_CONCURRENCY}...`);
+    const { attempted, captured } = await timed('Screenshots captured', () => (
+      capturePreviewFallbacks(captureCandidates, screenshotTools, assetCache)
+    ));
+    log(`Screenshot fallbacks: ${captured}/${attempted} captured.`);
     await screenshotTools.browser.close().catch(() => {});
   }
 
   logCoverCoverage(references);
 
   for (const reference of references) {
+    await normalizeReferenceAssets(reference);
     reference.asset = chooseCardAsset(reference);
     reference.previewStatus = {
       ...(reference.previewStatus || {}),
@@ -2299,6 +2595,7 @@ async function main() {
   await writeJson(path.join(dataDir, 'catalog-index.json'), catalogIndex);
   await writeJson(path.join(dataDir, 'catalog.json'), defaultCatalog);
   await writeJson(assetCacheFile, assetCache);
+  await writeJson(zoteroCacheFile, zoteroCache);
   log(`Wrote ${path.relative(projectRoot, path.join(dataDir, 'catalog-index.json'))} and latest catalog alias.`);
 }
 

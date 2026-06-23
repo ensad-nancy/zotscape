@@ -36,13 +36,19 @@ jobs:
           path: |
             .cache
             public/media
-          key: zotscape-enrichment-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-${{ github.run_id }}
+          key: zotscape-enrichment-${{ runner.os }}-${{ hashFiles('package-lock.json', 'scripts/collect-zotero.mjs') }}-${{ github.run_id }}
           restore-keys: |
-            zotscape-enrichment-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-
+            zotscape-enrichment-${{ runner.os }}-${{ hashFiles('package-lock.json', 'scripts/collect-zotero.mjs') }}-
+            zotscape-enrichment-${{ runner.os }}-
       - run: npm run collect
         env:
           GOOGLE_BOOKS_API_KEY: ${{ secrets.GOOGLE_BOOKS_API_KEY }}
           ISBNDB_API_KEY: ${{ secrets.ISBNDB_API_KEY }}
+          ZOTSCAPE_ENRICH_CONCURRENCY: 4
+          ZOTSCAPE_ZOTERO_PAGE_CONCURRENCY: 2
+          ZOTSCAPE_SCREENSHOT_CONCURRENCY: 2
+          ZOTSCAPE_SCREENSHOT_ATTEMPT_LIMIT: 36
+          ZOTSCAPE_WEB_CACHE_TTL_HOURS: 168
       - run: GITHUB_PAGES=true npm run build
       - uses: actions/upload-pages-artifact@v3
         with:
