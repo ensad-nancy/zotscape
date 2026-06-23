@@ -21,10 +21,12 @@ import {
 const BASE_URL = import.meta.env.BASE_URL || '/';
 const DEFAULT_LAYOUT = { width: 1800, height: 1200 };
 const RECENT_REFERENCE_COUNT = 6;
+const ALL_COLLECTIONS_ID = 'all';
 const VIEW_MODES = new Set(['atlas', 'list']);
-const LIST_SORTS = new Set(['recent', 'title', 'author', 'year']);
+const LIST_SORTS = new Set(['recent', 'citations', 'title', 'author', 'year']);
+const FEATURE_FILTERS = new Set(['annotations', 'shared']);
 const LEGACY_REFERENCE_KEY_PATTERN = /^[a-z0-9]{8}$/iu;
-const REFERENCE_HASH_SUFFIX_PATTERN = /--([^#/]+)$/u;
+const REFERENCE_HASH_SUFFIX_PATTERN = /--([^#/?]+)$/u;
 const IMAGE_PREVIEW_KINDS = new Set(['open-graph', 'archive', 'screenshot', 'pdf-screenshot', 'oembed']);
 const catalogCache = new Map();
 
@@ -65,34 +67,52 @@ function formatUpdated(value) {
   }
 }
 
-function readViewParams() {
-  const params = new URLSearchParams(window.location.search);
-  const view = params.get('view');
-  const sort = params.get('sort');
+function hashPathAndParams(hash = window.location.hash) {
+  const raw = String(hash || '').replace(/^#/u, '');
+  const queryIndex = raw.indexOf('?');
+  const rawPath = queryIndex === -1 ? raw : raw.slice(0, queryIndex);
+  const rawQuery = queryIndex === -1 ? '' : raw.slice(queryIndex + 1);
+  let path = rawPath;
+  try {
+    path = decodeURIComponent(rawPath);
+  } catch {
+    // Invalid hand-edited hashes are handled as unknown references/state.
+  }
   return {
-    view: VIEW_MODES.has(view) ? view : 'atlas',
-    sort: LIST_SORTS.has(sort) ? sort : 'recent',
-    year: params.get('year') || '',
+    path,
+    params: new URLSearchParams(rawQuery),
   };
 }
 
-function writeViewParams(view, sort, year, defaultYear, historyMode = 'replace') {
-  const url = new URL(window.location.href);
-  if (view === 'list') {
-    url.searchParams.set('view', 'list');
-    if (sort === 'recent') url.searchParams.delete('sort');
-    else url.searchParams.set('sort', sort);
-  } else {
-    url.searchParams.delete('view');
-    url.searchParams.delete('sort');
-  }
-  if (year && (year !== defaultYear || url.hash)) url.searchParams.set('year', year);
-  else url.searchParams.delete('year');
-  window.history[historyMode === 'push' ? 'pushState' : 'replaceState'](
-    { ...(window.history.state || {}) },
-    '',
-    url,
+function readViewParams() {
+  const legacyParams = new URLSearchParams(window.location.search);
+  const { params } = hashPathAndParams();
+  const value = (key, legacyKey = key) => (
+    params.has(key) ? params.get(key) : legacyParams.get(legacyKey)
   );
+  const collection = params.get('collection')
+    || params.get('memoir')
+    || legacyParams.get('collection')
+    || legacyParams.get('memoir')
+    || '';
+  const view = value('view');
+  const sort = value('sort');
+  const features = new Set(
+    String(value('features') || '')
+      .split(',')
+      .map((feature) => feature.trim())
+      .filter((feature) => FEATURE_FILTERS.has(feature)),
+  );
+  return {
+    view: VIEW_MODES.has(view) ? view : 'atlas',
+    sort: LIST_SORTS.has(sort) ? sort : 'recent',
+    year: value('root') || value('year') || '',
+    memoir: collection,
+    query: value('q') || '',
+    type: value('type') || '',
+    pubYear: value('pub') || '',
+    featureFilters: features,
+  };
 }
 
 function slugifyHashPart(value, fallback = 'reference') {
@@ -111,19 +131,14 @@ function referenceCitekeySlug(reference) {
   return slugifyHashPart(reference?.citationKey || reference?.key, String(reference?.key || 'reference').toLowerCase());
 }
 
-function referenceHash(reference) {
+function referenceHashPath(reference) {
   if (!reference?.key) return '';
-  return `#${referenceTitleSlug(reference)}--${referenceCitekeySlug(reference)}`;
+  return `${referenceTitleSlug(reference)}--${referenceCitekeySlug(reference)}`;
 }
 
 function referenceTokenFromHash(hash = window.location.hash) {
-  let decoded = String(hash || '');
-  try {
-    decoded = decodeURIComponent(decoded);
-  } catch {
-    // An invalid user-edited hash is handled like an unknown reference.
-  }
-  return slugifyHashPart(decoded.match(REFERENCE_HASH_SUFFIX_PATTERN)?.[1] || '', '');
+  const { path } = hashPathAndParams(hash);
+  return slugifyHashPart(path.match(REFERENCE_HASH_SUFFIX_PATTERN)?.[1] || '', '');
 }
 
 function referenceMatchesToken(reference, token) {
@@ -136,17 +151,46 @@ function findReferenceByHashToken(references, token) {
   return references.find((reference) => referenceMatchesToken(reference, token)) || null;
 }
 
-function referenceYearsForHashToken(index, token) {
-  if (!token || !LEGACY_REFERENCE_KEY_PATTERN.test(token)) return [];
-  return index.referenceYears?.[token.toUpperCase()] || [];
+function catalogEntries(index) {
+  return index?.collections || index?.years || [];
 }
 
-function writeReferenceHash(reference, year, defaultYear, historyMode = 'replace', detailEntry = false) {
+function defaultCatalogId(index) {
+  return index?.defaultRoot || index?.defaultYear || catalogEntries(index)[0]?.id || ALL_COLLECTIONS_ID;
+}
+
+function referenceCatalogsForHashToken(index, token) {
+  if (!token || !LEGACY_REFERENCE_KEY_PATTERN.test(token)) return [];
+  return index.referenceCollections?.[token.toUpperCase()]
+    || index.referenceYears?.[token.toUpperCase()]
+    || [];
+}
+
+function appHash(reference, state = {}, defaultYear = '') {
+  const params = new URLSearchParams();
+  if (state.year && state.year !== defaultYear) params.set('root', state.year);
+  if (state.view === 'list') params.set('view', 'list');
+  if (state.sort && state.sort !== 'recent') params.set('sort', state.sort);
+  if (state.memoir) params.set('collection', state.memoir);
+  if (state.query?.trim()) params.set('q', state.query.trim());
+  if (state.type) params.set('type', state.type);
+  if (state.pubYear) params.set('pub', state.pubYear);
+  const features = Array.from(state.featureFilters || [])
+    .filter((feature) => FEATURE_FILTERS.has(feature))
+    .sort();
+  if (features.length) params.set('features', features.join(','));
+  const path = referenceHashPath(reference);
+  const query = params.toString();
+  if (!path && !query) return '';
+  return `#${path}${query ? `?${query}` : ''}`;
+}
+
+function writeAppUrl({ reference = null, state = {}, defaultYear = '', historyMode = 'replace', detailEntry = false }) {
   const url = new URL(window.location.href);
-  url.hash = reference ? referenceHash(reference) : '';
-  if (reference && year) url.searchParams.set('year', year);
-  else if (year && year !== defaultYear) url.searchParams.set('year', year);
-  else url.searchParams.delete('year');
+  ['view', 'sort', 'root', 'year', 'collection', 'memoir', 'q', 'type', 'pub', 'features'].forEach((key) => {
+    url.searchParams.delete(key);
+  });
+  url.hash = appHash(reference, state, defaultYear);
   window.history[historyMode === 'push' ? 'pushState' : 'replaceState'](
     {
       ...(window.history.state || {}),
@@ -175,7 +219,7 @@ function getSearchBlob(reference) {
 function typeOptions(references) {
   return Array.from(new Map(references.map((reference) => [
     reference.itemType,
-    reference.typeLabel || reference.itemType,
+    displayTypeLabel(reference),
   ])).entries())
     .sort((left, right) => left[1].localeCompare(right[1], 'fr'));
 }
@@ -243,22 +287,49 @@ function supportType(reference) {
   if (reference.itemType === 'book') return 'book';
   if (reference.itemType === 'bookSection') return 'chapter';
   if (reference.itemType === 'film' || reference.itemType === 'videoRecording' || reference.itemType === 'tvBroadcast') return 'film';
-  if (reference.itemType === 'webpage' || reference.itemType === 'blogPost') return 'web';
+  if (reference.itemType === 'webpage' || reference.itemType === 'blogPost' || reference.itemType === 'encyclopediaArticle') return 'web';
   if (reference.itemType === 'journalArticle' || reference.itemType === 'newspaperArticle') return 'article';
   if (reference.itemType === 'thesis') return 'thesis';
   return 'document';
 }
 
+function displayTypeLabel(reference) {
+  const type = supportType(reference);
+  if (type === 'thesis') return 'Document / thèse';
+  if (type === 'chapter') return 'Chapitre';
+  if (type === 'web') return 'Page web';
+  if (type === 'film') return 'Film';
+  if (reference.itemType === 'document') return 'Document';
+  return reference.typeLabel || reference.itemType;
+}
+
+function atlasCaptionWidth(reference, layout) {
+  const assetKind = reference.asset?.kind || 'fallback';
+  const type = supportType(reference);
+  if (!layout?.width || !layout?.mediaHeight || assetKind === 'fallback') return layout?.width || 0;
+  const ratio = Number(reference.asset?.ratio || (
+    reference.asset?.width && reference.asset?.height
+      ? reference.asset.width / reference.asset.height
+      : 0
+  ));
+  if (!Number.isFinite(ratio) || ratio <= 0) return layout.width;
+  if (type === 'web') return layout.width;
+  if (type === 'film') {
+    return Math.min(layout.width, Math.max(72, (layout.mediaHeight - 28) * ratio + 40));
+  }
+  return Math.min(layout.width, Math.max(56, layout.mediaHeight * ratio));
+}
+
 function memoirDisplay(name = '') {
   const [person, ...topicParts] = String(name).split(/\s+—\s+/u);
   const topic = topicParts.join(' — ').trim();
-  if (topic) return { primary: topic, secondary: `Mémoire de ${person}` };
-  return { primary: 'Mémoire en cours', secondary: person };
+  if (topic) return { primary: topic, secondary: `Collection de ${person}` };
+  return { primary: 'Collection en cours', secondary: person };
 }
 
 function memoirReaderLabel(name = '') {
   const display = memoirDisplay(name);
-  return display.primary === 'Mémoire en cours'
+  return display.primary === 'Collection en cours'
     ? `${display.primary} · ${display.secondary}`
     : display.primary;
 }
@@ -350,6 +421,12 @@ function sortByRecent(left, right) {
 
 function sortListReferences(references, sort) {
   return [...references].sort((left, right) => {
+    if (sort === 'citations') {
+      const leftCount = left.memoirKeys?.length || 0;
+      const rightCount = right.memoirKeys?.length || 0;
+      if (leftCount !== rightCount) return rightCount - leftCount;
+      return sortByRecent(left, right);
+    }
     if (sort === 'title') {
       return left.title.localeCompare(right.title, 'fr')
         || left.creatorsLabel.localeCompare(right.creatorsLabel, 'fr')
@@ -425,7 +502,7 @@ function sourceActionLabel(reference) {
   if (type === 'film') return 'Regarder le film';
   if (type === 'web') return 'Voir le site';
   if (type === 'article') return 'Lire l’article';
-  if (type === 'thesis') return 'Consulter le mémoire';
+  if (type === 'thesis') return 'Consulter le document';
   if (type === 'book' || type === 'chapter') return 'Consulter le livre';
   return 'Consulter la ressource';
 }
@@ -649,6 +726,14 @@ function ReferenceStickers({ recent = false, shared = false, className = '' }) {
 function ReferenceVisual({ reference, detail = false, overlay = null, onImageRatio = null }) {
   const assetKind = reference.asset?.kind || 'fallback';
   const type = supportType(reference);
+  const assetRatio = Number(reference.asset?.ratio || (
+    reference.asset?.width && reference.asset?.height
+      ? reference.asset.width / reference.asset.height
+      : 0
+  ));
+  const orientation = assetRatio > 0
+    ? (assetRatio > 1.08 ? 'landscape' : assetRatio < 0.88 ? 'portrait' : 'square')
+    : 'unknown';
   if (assetKind === 'fallback') {
     const showKicker = !(type === 'web' && !detail);
     return (
@@ -656,7 +741,7 @@ function ReferenceVisual({ reference, detail = false, overlay = null, onImageRat
         className={`dom-fallback dom-fallback--${type}${detail ? ' dom-fallback--detail' : ''}`}
         style={fallbackPalette(reference)}
       >
-        {showKicker && <span className="dom-fallback-kicker">{reference.typeLabel}</span>}
+        {showKicker && <span className="dom-fallback-kicker">{displayTypeLabel(reference)}</span>}
         <strong>{reference.title}</strong>
         {reference.creatorsLabel && <span className="dom-fallback-authors">{reference.creatorsLabel}</span>}
         <em>{reference.year || 's. d.'}</em>
@@ -676,9 +761,21 @@ function ReferenceVisual({ reference, detail = false, overlay = null, onImageRat
       } : undefined}
     />
   );
-  if (detail) return image;
+  const previewClass = IMAGE_PREVIEW_KINDS.has(assetKind) ? ' object-visual-shell--preview' : '';
+  const shellClassName = `object-visual-shell object-visual-shell--${assetKind} object-visual-shell--${type} object-visual-shell--${orientation}${previewClass}${detail ? ' object-visual-shell--detail' : ''}`;
+  const shellStyle = assetRatio > 0 ? { '--asset-ratio': assetRatio } : undefined;
+  if (detail) {
+    return (
+      <span className={shellClassName} style={shellStyle}>
+        {image}
+      </span>
+    );
+  }
   return (
-    <span className={`object-visual-shell object-visual-shell--${assetKind} object-visual-shell--${type}`}>
+    <span
+      className={shellClassName}
+      style={shellStyle}
+    >
       {image}
       {overlay}
     </span>
@@ -729,10 +826,10 @@ function ViewSwitcher({ value, onChange }) {
   );
 }
 
-function YearSelector({ activeYear, years, onChange }) {
+function CollectionSelector({ activeCollection, collections, onChange }) {
   const [open, setOpen] = useState(false);
   const selectorRef = useRef(null);
-  const current = years.find((year) => year.id === activeYear) || years[0];
+  const current = collections.find((collection) => collection.id === activeCollection) || collections[0];
 
   useEffect(() => {
     if (!open) return undefined;
@@ -747,30 +844,29 @@ function YearSelector({ activeYear, years, onChange }) {
     };
   }, [open]);
 
-  if (years.length < 2) return <h1>{current?.label || `Mémoires ${activeYear}`}</h1>;
   return (
-    <div className="year-selector" ref={selectorRef}>
+    <div className="collection-selector" ref={selectorRef}>
       <h1>
         <button type="button" onClick={() => setOpen((value) => !value)} aria-expanded={open}>
-          <span>{current?.label || `Mémoires ${activeYear}`}</span>
+          <span>{current?.label || 'Corpus'}</span>
           <ChevronDown size={17} aria-hidden="true" />
         </button>
       </h1>
       {open && (
-        <div className="year-selector-menu" role="menu">
-          {years.map((year) => (
+        <div className="collection-selector-menu" role="menu">
+          {collections.map((collection) => (
             <button
               type="button"
               role="menuitemradio"
-              aria-checked={year.id === activeYear}
-              key={year.id}
+              aria-checked={collection.id === activeCollection}
+              key={collection.id}
               onClick={() => {
                 setOpen(false);
-                onChange(year.id);
+                onChange(collection.id);
               }}
             >
-              <span>{year.label}</span>
-              <small>{year.stats?.referenceCount || 0} références</small>
+              <span>{collection.label}</span>
+              <small>{collection.stats?.referenceCount || 0} références</small>
             </button>
           ))}
         </div>
@@ -787,7 +883,7 @@ function ReferenceListRow({ reference, active, recent, shared, onSelect }) {
   const annotationCount = reference.annotations?.count || 0;
   const noteCount = reference.notes?.length || 0;
   const context = [
-    reference.typeLabel,
+    displayTypeLabel(reference),
     reference.year,
     ...(reference.memoirNames || []).map(memoirReaderLabel),
     annotationCount > 0 ? `${annotationCount} surligne${annotationCount > 1 ? 's' : ''}` : '',
@@ -848,6 +944,7 @@ function ReferenceList({ references, sort, onSortChange, recentKeys, sharedKeys,
             <span>Trier par</span>
             <select value={sort} onChange={(event) => onSortChange(event.target.value)}>
               <option value="recent">Ajouts récents</option>
+              <option value="citations">Citations</option>
               <option value="title">Titre</option>
               <option value="author">Auteur</option>
               <option value="year">Année</option>
@@ -938,10 +1035,10 @@ function ToolPanel({
         </div>
 
         <fieldset className="memoir-filter">
-          <legend>Mémoires</legend>
+          <legend>Collections</legend>
           <div className="memoir-filter-list">
             <button className={!activeMemoir ? 'is-active' : ''} type="button" onClick={() => setActiveMemoir('')} aria-pressed={!activeMemoir}>
-              <span><strong>Toutes les références</strong><small>Collection en constitution</small></span>
+              <span><strong>Toutes les références</strong><small>Corpus complet</small></span>
               <em>{referenceCount}</em>
             </button>
             {memoirs.map((memoir) => {
@@ -972,7 +1069,7 @@ function ToolPanel({
 
         <div className="tool-cluster" aria-label="Filtres lecteurs">
           <FeatureToggle active={featureFilters.has('annotations')} icon={Highlighter} label="Avec surlignes" onClick={() => setFeatureFilters(toggleSet(featureFilters, 'annotations'))} />
-          <FeatureToggle active={featureFilters.has('shared')} icon={UsersRound} label="Points de rencontre" onClick={() => setFeatureFilters(toggleSet(featureFilters, 'shared'))} />
+          <FeatureToggle active={featureFilters.has('shared')} icon={UsersRound} label="Références partagées" onClick={() => setFeatureFilters(toggleSet(featureFilters, 'shared'))} />
         </div>
 
         <details className="secondary-filters" open={Boolean(yearFilter)}>
@@ -1020,13 +1117,13 @@ function AboutPanel({ open, catalog, onClose }) {
           </button>
         </div>
         <div className="about-intro">
-          <p>Cette table rassemble les livres, films, articles et sites qui accompagnent les mémoires en cours à l’Ensad Nancy.</p>
-          <p>Elle ne cherche pas à figer une bibliographie. Elle montre une collection en train de se faire : des références arrivent, circulent entre les recherches, se couvrent de notes et laissent une trace d’une promotion à l’autre.</p>
+          <p>Cette table rassemble les livres, films, articles et sites qui composent un corpus de recherche à l’Ensad Nancy.</p>
+          <p>Elle ne cherche pas à figer une bibliographie. Elle montre une collection en train de se faire : des références arrivent, circulent entre les projets, se couvrent de notes et dessinent des proximités.</p>
         </div>
         <dl className="about-stats">
           <div><dt>Références</dt><dd>{catalog.stats.referenceCount}</dd></div>
-          <div><dt>Mémoires</dt><dd>{catalog.stats.memoirCount}</dd></div>
-          <div><dt>Points de rencontre</dt><dd>{catalog.stats.sharedReferenceCount || 0}</dd></div>
+          <div><dt>Collections</dt><dd>{catalog.stats.memoirCount}</dd></div>
+          <div><dt>Références partagées</dt><dd>{catalog.stats.sharedReferenceCount || 0}</dd></div>
           <div><dt>Surlignes</dt><dd>{catalog.stats.annotationCount || 0}</dd></div>
         </dl>
         <p className="about-updated">Mis à jour le {formatUpdated(catalog.generatedAt)}</p>
@@ -1043,11 +1140,12 @@ function AboutPanel({ open, catalog, onClose }) {
   );
 }
 
-function AtlasObject({ reference, layout, active, related, recent, shared, onSelect, onHover, onImageRatio }) {
+function AtlasObject({ reference, layout, active, related, recent, shared, onSelect, onImageRatio }) {
   const assetKind = reference.asset?.kind || 'fallback';
   const type = supportType(reference);
   const landscapeCover = assetKind === 'cover' && Number(reference.asset?.ratio || 0) > 1.08;
   const stickers = <ReferenceStickers recent={recent} shared={shared} />;
+  const captionWidth = atlasCaptionWidth(reference, layout);
 
   return (
     <article
@@ -1057,12 +1155,11 @@ function AtlasObject({ reference, layout, active, related, recent, shared, onSel
         height: layout.height,
         '--media-height': `${layout.mediaHeight}px`,
         '--caption-height': `${layout.captionHeight}px`,
+        '--caption-width': `${captionWidth}px`,
         '--atlas-x': `${layout.x}px`,
         '--atlas-y': `${layout.y}px`,
         zIndex: active ? 24 : related ? 16 : shared ? 14 : recent ? 10 : layout.layer || 1,
       }}
-      onMouseEnter={() => onHover(reference.key)}
-      onMouseLeave={() => onHover('')}
     >
       <button
         className="atlas-object-main"
@@ -1177,7 +1274,7 @@ function MiniMap({ items, layout, activeKey, transformState, viewport, onNavigat
   );
 }
 
-function DetailPanel({ reference, suggestions, onSelect, onClose, suspended }) {
+function DetailPanel({ reference, suggestions, onSelect, onCollectionSelect, onClose, suspended }) {
   useEffect(() => {
     if (!reference || suspended) return undefined;
     const handleKey = (event) => {
@@ -1233,9 +1330,21 @@ function DetailPanel({ reference, suggestions, onSelect, onClose, suspended }) {
 
         {(reference.memoirNames || []).length > 0 && (
           <section className="detail-collections">
-            <p>Mobilisé dans</p>
+            <p>Présent dans</p>
             <div className="detail-rubrics">
-              {(reference.memoirNames || []).map((name) => <span key={name}>{memoirReaderLabel(name)}</span>)}
+              {(reference.memoirNames || []).map((name, index) => {
+                const memoirKey = reference.memoirKeys?.[index] || '';
+                return (
+                  <button
+                    key={`${memoirKey || name}-${index}`}
+                    type="button"
+                    onClick={() => memoirKey && onCollectionSelect?.(memoirKey)}
+                    disabled={!memoirKey}
+                  >
+                    {memoirReaderLabel(name)}
+                  </button>
+                );
+              })}
             </div>
           </section>
         )}
@@ -1284,7 +1393,7 @@ function DetailPanel({ reference, suggestions, onSelect, onClose, suspended }) {
 
         {suggestions.length > 0 && (
           <section className="detail-suggestions">
-            <h3>Dans le même mémoire</h3>
+            <h3>Dans la même collection</h3>
             <div>
               {suggestions.map((suggestion) => (
                 <button type="button" key={suggestion.key} onClick={() => onSelect(suggestion)}>
@@ -1304,7 +1413,7 @@ function DetailPanel({ reference, suggestions, onSelect, onClose, suspended }) {
         <details className="detail-bibliography">
           <summary>Informations bibliographiques</summary>
           <dl className="detail-meta">
-            <dt>Type</dt><dd>{reference.typeLabel}</dd>
+            <dt>Type</dt><dd>{displayTypeLabel(reference)}</dd>
             {reference.year && <><dt>Année</dt><dd>{reference.year}</dd></>}
             {reference.publisher && <><dt>Édition</dt><dd>{reference.publisher}</dd></>}
             {reference.publicationTitle && <><dt>Revue</dt><dd>{reference.publicationTitle}</dd></>}
@@ -1340,9 +1449,33 @@ function EmptyState() {
   );
 }
 
-async function loadCatalogForYear(index, yearId) {
-  const entry = index.years.find((year) => year.id === yearId);
-  if (!entry) throw new Error(`Promotion inconnue : ${yearId}`);
+function normalizeCatalogIndexLabels(index) {
+  return {
+    ...index,
+    collections: catalogEntries(index).map((collection) => ({
+      ...collection,
+      label: collection.label || collection.id || 'Collection',
+    })),
+    years: (index.years || []).map((year) => ({ ...year, label: year.label || year.id || 'Collection' })),
+  };
+}
+
+function collectionOptions(index) {
+  const collections = catalogEntries(index);
+  const allStats = collections.reduce((stats, collection) => ({
+    referenceCount: stats.referenceCount + (collection.stats?.referenceCount || 0),
+  }), { referenceCount: 0 });
+  return [
+    {
+      id: ALL_COLLECTIONS_ID,
+      label: 'Toutes les collections',
+      stats: allStats,
+    },
+    ...collections,
+  ];
+}
+
+async function loadCatalogEntry(entry) {
   const cacheKey = entry.catalog;
   if (catalogCache.has(cacheKey)) return catalogCache.get(cacheKey);
   const response = await fetch(assetUrl(entry.catalog));
@@ -1352,13 +1485,113 @@ async function loadCatalogForYear(index, yearId) {
   return payload;
 }
 
+function mergeMemoirMemberships(existing, incoming) {
+  const pairs = new Map();
+  const addPair = (key, name) => {
+    if (!key) return;
+    pairs.set(key, name || existing.memoirNames?.[existing.memoirKeys?.indexOf(key)] || key);
+  };
+  (existing.memoirKeys || []).forEach((key, index) => addPair(key, existing.memoirNames?.[index]));
+  (incoming.memoirKeys || []).forEach((key, index) => addPair(key, incoming.memoirNames?.[index]));
+  return {
+    memoirKeys: Array.from(pairs.keys()),
+    memoirNames: Array.from(pairs.values()),
+  };
+}
+
+function aggregateCatalogs(index, catalogs) {
+  const referencesByKey = new Map();
+  catalogs.forEach((catalog) => {
+    (catalog.references || []).forEach((reference) => {
+      const previous = referencesByKey.get(reference.key);
+      if (!previous) {
+        referencesByKey.set(reference.key, { ...reference });
+        return;
+      }
+      referencesByKey.set(reference.key, {
+        ...previous,
+        tags: Array.from(new Set([...(previous.tags || []), ...(reference.tags || [])])),
+        ...mergeMemoirMemberships(previous, reference),
+      });
+    });
+  });
+
+  const references = Array.from(referencesByKey.values());
+  const memoirsByKey = new Map();
+  catalogs.forEach((catalog) => {
+    (catalog.memoirs || []).forEach((memoir) => {
+      if (!memoirsByKey.has(memoir.key)) memoirsByKey.set(memoir.key, { ...memoir });
+    });
+  });
+  const memoirs = Array.from(memoirsByKey.values())
+    .map((memoir) => ({
+      ...memoir,
+      referenceCount: references.filter((reference) => reference.memoirKeys?.includes(memoir.key)).length,
+    }))
+    .sort((left, right) => left.name.localeCompare(right.name, 'fr'));
+  const coverSources = {};
+  catalogs.forEach((catalog) => {
+    Object.entries(catalog.stats?.coverCoverage?.bySource || {}).forEach(([source, count]) => {
+      coverSources[source] = (coverSources[source] || 0) + count;
+    });
+  });
+  const generatedAt = catalogs
+    .map((catalog) => catalog.generatedAt)
+    .filter(Boolean)
+    .sort()
+    .at(-1);
+  const first = catalogs[0] || {};
+  return {
+    generatedAt,
+    source: {
+      ...(first.source || {}),
+      rootCollectionKey: ALL_COLLECTIONS_ID,
+      rootCollectionName: 'Toutes les collections',
+      rootCollectionUrl: first.source?.groupUrl,
+      rootId: ALL_COLLECTIONS_ID,
+      yearId: ALL_COLLECTIONS_ID,
+    },
+    stats: {
+      referenceCount: references.length,
+      memoirCount: memoirs.length,
+      sharedReferenceCount: references.filter((reference) => (reference.memoirKeys || []).length > 1).length,
+      annotationCount: references.reduce((sum, reference) => sum + (reference.annotations?.count || 0), 0),
+      noteCount: references.reduce((sum, reference) => sum + (reference.notes?.length || 0), 0),
+      attachmentCount: references.filter((reference) => reference.asset?.src || reference.embed?.src || reference.url).length,
+      coverCoverage: {
+        bySource: coverSources,
+      },
+    },
+    layout: DEFAULT_LAYOUT,
+    memoirs,
+    references,
+    sharedReferences: references.filter((reference) => (reference.memoirKeys || []).length > 1).map((reference) => reference.key),
+  };
+}
+
+async function loadCatalogForYear(index, yearId) {
+  if (yearId === ALL_COLLECTIONS_ID) {
+    const entries = catalogEntries(index);
+    const cacheKey = `${ALL_COLLECTIONS_ID}:${entries.map((entry) => entry.catalog).join('|')}`;
+    if (catalogCache.has(cacheKey)) return catalogCache.get(cacheKey);
+    const catalogs = await Promise.all(entries.map(loadCatalogEntry));
+    const payload = aggregateCatalogs(index, catalogs);
+    catalogCache.set(cacheKey, payload);
+    return payload;
+  }
+  const entry = catalogEntries(index).find((collection) => collection.id === yearId);
+  if (!entry) throw new Error(`Collection inconnue : ${yearId}`);
+  return loadCatalogEntry(entry);
+}
+
 function legacyCatalogIndex(catalog) {
-  const yearId = catalog.source?.yearId
+  const yearId = catalog.source?.rootId
+    || catalog.source?.yearId
     || catalog.source?.rootCollectionName?.match(/(\d{4}-\d{2,4})/u)?.[1]
     || 'courant';
   const entry = {
     id: yearId,
-    label: catalog.source?.rootCollectionName || `Mémoires ${yearId}`,
+    label: catalog.source?.rootCollectionName || 'Collection',
     catalog: 'data/catalog.json',
     rootCollectionUrl: catalog.source?.rootCollectionUrl,
     stats: catalog.stats,
@@ -1367,13 +1600,16 @@ function legacyCatalogIndex(catalog) {
   catalogCache.set(entry.catalog, catalog);
   return {
     generatedAt: catalog.generatedAt,
+    defaultRoot: yearId,
     defaultYear: yearId,
     group: {
       id: catalog.source?.groupId,
       name: catalog.source?.groupName,
       url: catalog.source?.groupUrl,
     },
+    collections: [entry],
     years: [entry],
+    referenceCollections: Object.fromEntries((catalog.references || []).map((reference) => [reference.key, [yearId]])),
     referenceYears: Object.fromEntries((catalog.references || []).map((reference) => [reference.key, [yearId]])),
   };
 }
@@ -1394,7 +1630,6 @@ export default function App() {
   const [selectedReference, setSelectedReference] = useState(null);
   const [viewMode, setViewMode] = useState(() => readViewParams().view);
   const [listSort, setListSort] = useState(() => readViewParams().sort);
-  const [hoveredKey, setHoveredKey] = useState('');
   const [focusReferenceKey, setFocusReferenceKey] = useState('');
   const [transformState, setTransformState] = useState({ scale: 1, positionX: 0, positionY: 0 });
   const [viewport, setViewport] = useState({ width: 1280, height: 720 });
@@ -1408,7 +1643,7 @@ export default function App() {
         const response = await fetch(`${BASE_URL}data/catalog-index.json`);
         if (response.ok) {
           const payload = await response.json();
-          if (!cancelled) setCatalogIndex(payload);
+          if (!cancelled) setCatalogIndex(normalizeCatalogIndexLabels(payload));
           return;
         }
         const legacyResponse = await fetch(`${BASE_URL}data/catalog.json`);
@@ -1416,7 +1651,7 @@ export default function App() {
         const legacyCatalog = await legacyResponse.json();
         if (!cancelled) setCatalogIndex(legacyCatalogIndex(legacyCatalog));
       } catch (loadError) {
-        if (!cancelled) setError(loadError.message || 'Chargement impossible');
+      if (!cancelled) setError(loadError.message || 'Chargement impossible');
       }
     }
     loadIndex();
@@ -1441,17 +1676,16 @@ export default function App() {
       const currentRequest = ++requestId;
       const next = readViewParams();
       const hashToken = referenceTokenFromHash();
-      const availableYears = new Set(catalogIndex.years.map((year) => year.id));
-      const referenceYears = referenceYearsForHashToken(catalogIndex, hashToken);
+      const availableYears = new Set([ALL_COLLECTIONS_ID, ...catalogEntries(catalogIndex).map((collection) => collection.id)]);
+      const referenceYears = referenceCatalogsForHashToken(catalogIndex, hashToken);
       const requestedYear = availableYears.has(next.year) ? next.year : '';
       const targetYear = requestedYear
         || referenceYears.find((year) => availableYears.has(year))
-        || catalogIndex.defaultYear;
+        || defaultCatalogId(catalogIndex);
 
       try {
         const payload = await loadCatalogForYear(catalogIndex, targetYear);
         if (cancelled || currentRequest !== requestId) return;
-        if (activeYearRef.current && activeYearRef.current !== targetYear) resetTools();
         activeYearRef.current = targetYear;
         setActiveYear(targetYear);
         setCatalog(payload);
@@ -1459,24 +1693,32 @@ export default function App() {
         setToolsOpen(false);
         setAboutOpen(false);
         setFocusReferenceKey('');
-        setHoveredKey('');
         setViewMode(next.view);
         setListSort(next.sort);
+        setActiveMemoir(next.memoir);
+        setQuery(next.query);
+        setTypeFilter(next.type);
+        setYearFilter(next.pubYear);
+        setFeatureFilters(next.featureFilters);
 
         const reference = findReferenceByHashToken(payload.references || [], hashToken);
         setSelectedReference(reference || null);
-        writeViewParams(next.view, next.sort, targetYear, catalogIndex.defaultYear, 'replace');
-        if (reference) {
-          writeReferenceHash(
-            reference,
-            targetYear,
-            catalogIndex.defaultYear,
-            'replace',
-            Boolean(window.history.state?.zotscapeDetailEntry),
-          );
-        } else if (hashToken) {
-          writeReferenceHash(null, targetYear, catalogIndex.defaultYear, 'replace', false);
-        }
+        writeAppUrl({
+          reference,
+          state: {
+            view: next.view,
+            sort: next.sort,
+            year: targetYear,
+            memoir: next.memoir,
+            query: next.query,
+            type: next.type,
+            pubYear: next.pubYear,
+            featureFilters: next.featureFilters,
+          },
+          defaultYear: defaultCatalogId(catalogIndex),
+          historyMode: 'replace',
+          detailEntry: Boolean(reference && window.history.state?.zotscapeDetailEntry),
+        });
       } catch (loadError) {
         if (!cancelled) setError(loadError.message || 'Chargement impossible');
       }
@@ -1494,6 +1736,7 @@ export default function App() {
 
   const references = catalog?.references || [];
   const memoirs = catalog?.memoirs || [];
+  const rootCollections = useMemo(() => collectionOptions(catalogIndex), [catalogIndex]);
 
   useEffect(() => {
     if (!catalog) return;
@@ -1569,7 +1812,7 @@ export default function App() {
     );
   }, [focalBounds, viewport]);
 
-  const activeReference = selectedReference || references.find((reference) => reference.key === hoveredKey) || null;
+  const activeReference = selectedReference || null;
   const relatedKeys = useMemo(() => {
     if (!activeReference) return new Set();
     return new Set(
@@ -1584,11 +1827,38 @@ export default function App() {
     () => relatedReferences(selectedReference, references),
     [references, selectedReference],
   );
+  const activeSubcollection = useMemo(
+    () => memoirs.find((memoir) => memoir.key === activeMemoir) || null,
+    [activeMemoir, memoirs],
+  );
+  const activeSubcollectionLabel = activeSubcollection ? memoirReaderLabel(activeSubcollection.name) : '';
   const toolCount = activeToolCount({ activeMemoir, query, typeFilter, yearFilter, featureFilters });
   const focusItem = useMemo(
     () => visibleItems.find(({ reference }) => reference.key === focusReferenceKey) || null,
     [focusReferenceKey, visibleItems],
   );
+
+  const currentUrlState = () => ({
+    view: viewMode,
+    sort: listSort,
+    year: activeYear,
+    memoir: activeMemoir,
+    query,
+    type: typeFilter,
+    pubYear: yearFilter,
+    featureFilters,
+  });
+
+  useEffect(() => {
+    if (!catalog || !catalogIndex || !activeYear) return;
+    writeAppUrl({
+      reference: selectedReference,
+      state: currentUrlState(),
+      defaultYear: defaultCatalogId(catalogIndex),
+      historyMode: 'replace',
+      detailEntry: Boolean(selectedReference && window.history.state?.zotscapeDetailEntry),
+    });
+  }, [activeMemoir, activeYear, catalog, catalogIndex, featureFilters, listSort, query, selectedReference, typeFilter, viewMode, yearFilter]);
 
   useEffect(() => {
     setTransformState((current) => ({ ...current, scale: fixedScale }));
@@ -1597,9 +1867,15 @@ export default function App() {
   useEffect(() => {
     if (selectedReference && !filteredReferences.some((reference) => reference.key === selectedReference.key)) {
       setSelectedReference(null);
-      writeReferenceHash(null, activeYear, catalogIndex?.defaultYear, 'replace', false);
+      writeAppUrl({
+        reference: null,
+        state: currentUrlState(),
+        defaultYear: defaultCatalogId(catalogIndex),
+        historyMode: 'replace',
+        detailEntry: false,
+      });
     }
-  }, [activeYear, catalogIndex?.defaultYear, filteredReferences, selectedReference]);
+  }, [activeYear, catalogIndex, filteredReferences, selectedReference]);
 
   useEffect(() => {
     if (viewMode !== 'atlas') return undefined;
@@ -1642,6 +1918,20 @@ export default function App() {
     setFeatureFilters(new Set());
   }
 
+  function selectCollectionFilter(memoirKey) {
+    if (!memoirKey) return;
+    setActiveMemoir(memoirKey);
+    setToolsOpen(false);
+    setAboutOpen(false);
+    writeAppUrl({
+      reference: selectedReference,
+      state: { ...currentUrlState(), memoir: memoirKey },
+      defaultYear: defaultCatalogId(catalogIndex),
+      historyMode: 'replace',
+      detailEntry: Boolean(selectedReference && window.history.state?.zotscapeDetailEntry),
+    });
+  }
+
   function recordAssetRatio(referenceKey, ratio) {
     if (!referenceKey || !Number.isFinite(ratio) || ratio <= 0) return;
     setMeasuredAssetRatios((current) => {
@@ -1656,14 +1946,25 @@ export default function App() {
   function changeViewMode(nextView) {
     if (!VIEW_MODES.has(nextView) || nextView === viewMode) return;
     setViewMode(nextView);
-    setHoveredKey('');
-    writeViewParams(nextView, listSort, activeYear, catalogIndex.defaultYear, selectedReference ? 'replace' : 'push');
+    writeAppUrl({
+      reference: selectedReference,
+      state: { ...currentUrlState(), view: nextView },
+      defaultYear: defaultCatalogId(catalogIndex),
+      historyMode: selectedReference ? 'replace' : 'push',
+      detailEntry: Boolean(selectedReference && window.history.state?.zotscapeDetailEntry),
+    });
   }
 
   function changeListSort(nextSort) {
     if (!LIST_SORTS.has(nextSort) || nextSort === listSort) return;
     setListSort(nextSort);
-    writeViewParams(viewMode, nextSort, activeYear, catalogIndex.defaultYear, 'replace');
+    writeAppUrl({
+      reference: selectedReference,
+      state: { ...currentUrlState(), sort: nextSort },
+      defaultYear: defaultCatalogId(catalogIndex),
+      historyMode: 'replace',
+      detailEntry: Boolean(selectedReference && window.history.state?.zotscapeDetailEntry),
+    });
   }
 
   async function changeCatalogYear(nextYear) {
@@ -1675,15 +1976,25 @@ export default function App() {
       setActiveYear(nextYear);
       activeYearRef.current = nextYear;
       setSelectedReference(null);
-      setHoveredKey('');
       setFocusReferenceKey('');
       setToolsOpen(false);
       setAboutOpen(false);
-      const url = new URL(window.location.href);
-      url.hash = '';
-      if (nextYear === catalogIndex.defaultYear) url.searchParams.delete('year');
-      else url.searchParams.set('year', nextYear);
-      window.history.pushState({ ...(window.history.state || {}), zotscapeDetailEntry: false }, '', url);
+      writeAppUrl({
+        reference: null,
+        state: {
+          view: viewMode,
+          sort: listSort,
+          year: nextYear,
+          memoir: '',
+          query: '',
+          type: '',
+          pubYear: '',
+          featureFilters: new Set(),
+        },
+        defaultYear: defaultCatalogId(catalogIndex),
+        historyMode: 'push',
+        detailEntry: false,
+      });
     } catch (loadError) {
       setError(loadError.message || 'Chargement impossible');
     }
@@ -1692,13 +2003,13 @@ export default function App() {
   function openReference(reference) {
     const replacing = Boolean(selectedReference);
     setSelectedReference(reference);
-    writeReferenceHash(
+    writeAppUrl({
       reference,
-      activeYear,
-      catalogIndex.defaultYear,
-      replacing ? 'replace' : 'push',
-      replacing ? Boolean(window.history.state?.zotscapeDetailEntry) : true,
-    );
+      state: currentUrlState(),
+      defaultYear: defaultCatalogId(catalogIndex),
+      historyMode: replacing ? 'replace' : 'push',
+      detailEntry: replacing ? Boolean(window.history.state?.zotscapeDetailEntry) : true,
+    });
   }
 
   function closeReference() {
@@ -1708,7 +2019,13 @@ export default function App() {
       window.history.back();
       return;
     }
-    writeReferenceHash(null, activeYear, catalogIndex.defaultYear, 'replace', false);
+    writeAppUrl({
+      reference: null,
+      state: currentUrlState(),
+      defaultYear: defaultCatalogId(catalogIndex),
+      historyMode: 'replace',
+      detailEntry: false,
+    });
   }
 
   function openSearch() {
@@ -1767,12 +2084,15 @@ export default function App() {
             <span>EnsadNancy</span>
           </a>
           <div className="atlas-title">
-            <YearSelector activeYear={activeYear} years={catalogIndex.years} onChange={changeCatalogYear} />
-            <p>
+            <CollectionSelector activeCollection={activeYear} collections={rootCollections} onChange={changeCatalogYear} />
+            {activeSubcollectionLabel && (
+              <p className="atlas-subtitle">Sous-collection · {activeSubcollectionLabel}</p>
+            )}
+            <p className="atlas-meta">
               {filteredReferences.length === catalog.stats.referenceCount
                 ? `${catalog.stats.referenceCount} références`
                 : `${filteredReferences.length} sur ${catalog.stats.referenceCount} références`}
-              {' · '}{catalog.stats.memoirCount} mémoires en cours
+              {' · '}{catalog.stats.memoirCount} collections
               {' · '}mis à jour le {formatUpdated(catalog.generatedAt)}
             </p>
           </div>
@@ -1841,7 +2161,6 @@ export default function App() {
                             recent={recentKeys.has(reference.key)}
                             shared={sharedKeys.has(reference.key)}
                             onSelect={openReference}
-                            onHover={setHoveredKey}
                             onImageRatio={recordAssetRatio}
                           />
                         ))}
@@ -1896,6 +2215,7 @@ export default function App() {
         reference={selectedReference}
         suggestions={suggestions}
         onSelect={openReference}
+        onCollectionSelect={selectCollectionFilter}
         onClose={closeReference}
         suspended={toolsOpen || aboutOpen}
       />
