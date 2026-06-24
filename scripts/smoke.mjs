@@ -42,6 +42,19 @@ function referenceHashPath(reference) {
   return `${title}--${key}`;
 }
 
+function isStaticSmokeReference(reference) {
+  return Boolean(
+    reference?.title
+    && reference?.key
+    && ['book', 'bookSection', 'thesis'].includes(reference.itemType)
+    && reference.asset?.kind === 'cover',
+  );
+}
+
+function referenceButtonLabel(reference) {
+  return `${reference.title}, ${reference.creatorsLabel || 'Auteur inconnu'}`;
+}
+
 async function readJson(filePath) {
   return JSON.parse(await fs.readFile(filePath, 'utf8'));
 }
@@ -153,7 +166,8 @@ async function main() {
   const firstCatalogEntry = index.collections?.[0];
   assert(firstCatalogEntry, 'No collection in dist/data/catalog-index.json.');
   const firstCatalog = await readJson(path.join(distDir, firstCatalogEntry.catalog));
-  const deepLinkReference = firstCatalog.references?.find((reference) => reference?.title && reference?.key);
+  const deepLinkReference = firstCatalog.references?.find(isStaticSmokeReference)
+    || firstCatalog.references?.find((reference) => reference?.title && reference?.key);
   assert(deepLinkReference, `No reference found in ${firstCatalogEntry.catalog}.`);
 
   const { server, url: baseUrl, basePath } = await startStaticServer();
@@ -184,7 +198,7 @@ async function main() {
     assert(rootState.title, 'Root page has no collection title.');
     assert(!rootState.hasBrandText, 'Header brand link should expose only the pictogram visually.');
 
-    await page.locator('.atlas-object-main').first().click();
+    await page.getByRole('button', { name: referenceButtonLabel(deepLinkReference) }).click();
     await waitForAppSelector(page, '.detail-panel', 'Atlas detail', errors, failedResponses);
     await page.locator('.detail-panel button[aria-label="Fermer"]').click();
     await page.waitForSelector('.detail-panel', { state: 'detached', timeout: 10_000 });
