@@ -25,7 +25,6 @@ const ALL_COLLECTIONS_ID = 'all';
 const VIEW_MODES = new Set(['atlas', 'list']);
 const LIST_SORTS = new Set(['recent', 'citations', 'title', 'author', 'year']);
 const FEATURE_FILTERS = new Set(['annotations', 'shared']);
-const LEGACY_REFERENCE_KEY_PATTERN = /^[a-z0-9]{8}$/iu;
 const REFERENCE_HASH_SUFFIX_PATTERN = /--([^#/?]+)$/u;
 const IMAGE_PREVIEW_KINDS = new Set(['open-graph', 'archive', 'screenshot', 'pdf-screenshot', 'oembed']);
 const catalogCache = new Map();
@@ -67,6 +66,12 @@ function formatUpdated(value) {
   }
 }
 
+function formatPhysicalSize(size) {
+  if (!size?.widthMm || !size?.heightMm) return '';
+  const values = [size.widthMm, size.heightMm, size.depthMm].filter(Boolean);
+  return `${values.join(' × ')} mm`;
+}
+
 function hashPathAndParams(hash = window.location.hash) {
   const raw = String(hash || '').replace(/^#/u, '');
   const queryIndex = raw.indexOf('?');
@@ -85,16 +90,9 @@ function hashPathAndParams(hash = window.location.hash) {
 }
 
 function readViewParams() {
-  const legacyParams = new URLSearchParams(window.location.search);
   const { params } = hashPathAndParams();
-  const value = (key, legacyKey = key) => (
-    params.has(key) ? params.get(key) : legacyParams.get(legacyKey)
-  );
-  const collection = params.get('collection')
-    || params.get('memoir')
-    || legacyParams.get('collection')
-    || legacyParams.get('memoir')
-    || '';
+  const value = (key) => (params.has(key) ? params.get(key) : '');
+  const collection = value('collection');
   const view = value('view');
   const sort = value('sort');
   const features = new Set(
@@ -106,8 +104,8 @@ function readViewParams() {
   return {
     view: VIEW_MODES.has(view) ? view : 'atlas',
     sort: LIST_SORTS.has(sort) ? sort : 'recent',
-    year: value('root') || value('year') || '',
-    memoir: collection,
+    root: value('root') || '',
+    collection,
     query: value('q') || '',
     type: value('type') || '',
     pubYear: value('pub') || '',
@@ -152,26 +150,33 @@ function findReferenceByHashToken(references, token) {
 }
 
 function catalogEntries(index) {
-  return index?.collections || index?.years || [];
+  return index?.collections || [];
 }
 
-function defaultCatalogId(index) {
-  return index?.defaultRoot || index?.defaultYear || catalogEntries(index)[0]?.id || ALL_COLLECTIONS_ID;
+function defaultRootId(index) {
+  return index?.defaultRoot || catalogEntries(index)[0]?.id || ALL_COLLECTIONS_ID;
 }
 
-function referenceCatalogsForHashToken(index, token) {
-  if (!token || !LEGACY_REFERENCE_KEY_PATTERN.test(token)) return [];
-  return index.referenceCollections?.[token.toUpperCase()]
-    || index.referenceYears?.[token.toUpperCase()]
-    || [];
+function indexedRootsForHashToken(index, token) {
+  if (!token) return [];
+  const keys = [
+    token,
+    token.toLowerCase(),
+    token.toUpperCase(),
+  ];
+  for (const key of keys) {
+    const roots = index?.referenceCollections?.[key];
+    if (Array.isArray(roots) && roots.length) return roots;
+  }
+  return [];
 }
 
-function appHash(reference, state = {}, defaultYear = '') {
+function appHash(reference, state = {}, defaultRoot = '') {
   const params = new URLSearchParams();
-  if (state.year && state.year !== defaultYear) params.set('root', state.year);
+  if (state.root && state.root !== defaultRoot) params.set('root', state.root);
   if (state.view === 'list') params.set('view', 'list');
   if (state.sort && state.sort !== 'recent') params.set('sort', state.sort);
-  if (state.memoir) params.set('collection', state.memoir);
+  if (state.collection) params.set('collection', state.collection);
   if (state.query?.trim()) params.set('q', state.query.trim());
   if (state.type) params.set('type', state.type);
   if (state.pubYear) params.set('pub', state.pubYear);
@@ -180,17 +185,17 @@ function appHash(reference, state = {}, defaultYear = '') {
     .sort();
   if (features.length) params.set('features', features.join(','));
   const path = referenceHashPath(reference);
-  const query = params.toString();
+  const query = params.toString().replace(/%3A/giu, ':');
   if (!path && !query) return '';
   return `#${path}${query ? `?${query}` : ''}`;
 }
 
-function writeAppUrl({ reference = null, state = {}, defaultYear = '', historyMode = 'replace', detailEntry = false }) {
+function writeAppUrl({ reference = null, state = {}, defaultRoot = '', historyMode = 'replace', detailEntry = false }) {
   const url = new URL(window.location.href);
-  ['view', 'sort', 'root', 'year', 'collection', 'memoir', 'q', 'type', 'pub', 'features'].forEach((key) => {
+  ['view', 'sort', 'root', 'collection', 'q', 'type', 'pub', 'features', 'year', 'memoir'].forEach((key) => {
     url.searchParams.delete(key);
   });
-  url.hash = appHash(reference, state, defaultYear);
+  url.hash = appHash(reference, state, defaultRoot);
   window.history[historyMode === 'push' ? 'pushState' : 'replaceState'](
     {
       ...(window.history.state || {}),
@@ -242,9 +247,9 @@ function referenceMatchesFeature(reference, feature) {
   return true;
 }
 
-function activeToolCount({ activeMemoir, query, typeFilter, yearFilter, featureFilters }) {
+function activeToolCount({ activeCollection, query, typeFilter, yearFilter, featureFilters }) {
   return [
-    activeMemoir,
+    activeCollection,
     query,
     typeFilter,
     yearFilter,
@@ -320,25 +325,34 @@ function atlasCaptionWidth(reference, layout) {
   return Math.min(layout.width, Math.max(56, layout.mediaHeight * ratio));
 }
 
-function memoirDisplay(name = '') {
-  const [person, ...topicParts] = String(name).split(/\s+—\s+/u);
+function collectionDisplay(name = '') {
+  const [person, ...topicParts] = String(name || '').trim().split(/\s+—\s+/u);
   const topic = topicParts.join(' — ').trim();
   if (topic) return { primary: topic, secondary: `Collection de ${person}` };
-  return { primary: 'Collection en cours', secondary: person };
+  return { primary: String(person || '').trim() || 'Collection', secondary: '' };
 }
 
-function memoirReaderLabel(name = '') {
-  const display = memoirDisplay(name);
-  return display.primary === 'Collection en cours'
+function collectionReaderLabel(name = '') {
+  const display = collectionDisplay(name);
+  return display.secondary
     ? `${display.primary} · ${display.secondary}`
     : display.primary;
 }
 
-function objectDimensions(reference, featured = false, measuredRatios = new Map()) {
+function physicalScaleFactor(reference, enabled) {
+  if (!enabled || !reference.physicalSize || !['book', 'chapter', 'thesis'].includes(supportType(reference))) return 1;
+  const height = Number(reference.physicalSize.heightMm || 0);
+  if (!Number.isFinite(height) || height <= 0) return 1;
+  return clamp(height / 240, 0.72, 1.28);
+}
+
+function objectDimensions(reference, featured = false, measuredRatios = new Map(), physicalScale = false) {
   const type = supportType(reference);
   const assetKind = reference.asset?.kind || 'fallback';
   const seed = hashValue(reference.key || reference.title);
-  const scale = ([0.96, 1, 1.04][seed % 3]) * (featured ? 1.02 : 0.9);
+  const scale = ([0.96, 1, 1.04][seed % 3])
+    * (featured ? 1.02 : 0.9)
+    * physicalScaleFactor(reference, physicalScale);
   const captionHeight = featured ? 98 : 86;
   const gap = 10;
   if (assetKind === 'cover' && ['book', 'chapter', 'thesis'].includes(type)) {
@@ -507,7 +521,7 @@ function sourceActionLabel(reference) {
   return 'Consulter la ressource';
 }
 
-function packReferences(references, viewport, recentKeys, sharedKeys, sharedOnly, measuredRatios = new Map()) {
+function packReferences(references, viewport, recentKeys, sharedKeys, sharedOnly, measuredRatios = new Map(), physicalScale = false) {
   const compact = viewport.width < 760;
   const margin = compact ? 64 : 104;
   const tableWidth = clamp(
@@ -554,7 +568,7 @@ function packReferences(references, viewport, recentKeys, sharedKeys, sharedOnly
   for (let rowStart = 0; rowStart < featuredReferences.length; rowStart += columns) {
     const row = featuredReferences.slice(rowStart, rowStart + columns).map((reference) => ({
       reference,
-      size: objectDimensions(reference, true, measuredRatios),
+      size: objectDimensions(reference, true, measuredRatios, physicalScale),
     }));
     const rowWidth = row.reduce((sum, item) => sum + item.size.width, 0) + horizontalGap * (row.length - 1);
     const rowHeight = Math.max(...row.map((item) => item.size.height));
@@ -599,7 +613,7 @@ function packReferences(references, viewport, recentKeys, sharedKeys, sharedOnly
   const laneGapY = compact ? 22 : 26;
 
   const placeInLanes = (reference, index, meeting = false) => {
-    const size = objectDimensions(reference, false, measuredRatios);
+    const size = objectDimensions(reference, false, measuredRatios, physicalScale);
     const seed = hashValue(`${meeting ? 'meeting' : 'regular'}:${reference.key}:${index}`);
     const span = size.width <= columnWidth + columnGap * 0.45
       ? 1
@@ -651,8 +665,8 @@ function packReferences(references, viewport, recentKeys, sharedKeys, sharedOnly
     placeInLanes(reference, index, true);
   });
   const regularPlacementOrder = [...regularReferences].sort((left, right) => {
-    const leftSize = objectDimensions(left, false);
-    const rightSize = objectDimensions(right, false);
+    const leftSize = objectDimensions(left, false, measuredRatios, physicalScale);
+    const rightSize = objectDimensions(right, false, measuredRatios, physicalScale);
     return (rightSize.width * rightSize.height) - (leftSize.width * leftSize.height)
       || rightSize.width - leftSize.width
       || sortByRecent(left, right);
@@ -717,7 +731,7 @@ function ReferenceStickers({ recent = false, shared = false, className = '' }) {
   if (!recent && !shared) return null;
   return (
     <span className={`object-stickers${className ? ` ${className}` : ''}`} aria-hidden="true">
-      {recent && <span className="object-sticker object-sticker--new">new</span>}
+      {recent && <span className="object-sticker object-sticker--new">Nouv.</span>}
       {shared && <span className="object-sticker object-sticker--shared">🔥</span>}
     </span>
   );
@@ -866,7 +880,10 @@ function CollectionSelector({ activeCollection, collections, onChange }) {
               }}
             >
               <span>{collection.label}</span>
-              <small>{collection.stats?.referenceCount || 0} références</small>
+              <small>
+                {collection.groupLabel ? `${collection.groupLabel} · ` : ''}
+                {collection.stats?.referenceCount || 0} références
+              </small>
             </button>
           ))}
         </div>
@@ -885,7 +902,7 @@ function ReferenceListRow({ reference, active, recent, shared, onSelect }) {
   const context = [
     displayTypeLabel(reference),
     reference.year,
-    ...(reference.memoirNames || []).map(memoirReaderLabel),
+    ...(reference.memoirNames || []).map(collectionReaderLabel),
     annotationCount > 0 ? `${annotationCount} surligne${annotationCount > 1 ? 's' : ''}` : '',
     noteCount > 0 ? `${noteCount} note${noteCount > 1 ? 's' : ''}` : '',
   ].filter(Boolean);
@@ -976,8 +993,8 @@ function ReferenceList({ references, sort, onSortChange, recentKeys, sharedKeys,
 function ToolPanel({
   open,
   memoirs,
-  activeMemoir,
-  setActiveMemoir,
+  activeCollection,
+  setActiveCollection,
   query,
   setQuery,
   typeFilter,
@@ -1037,19 +1054,19 @@ function ToolPanel({
         <fieldset className="memoir-filter">
           <legend>Collections</legend>
           <div className="memoir-filter-list">
-            <button className={!activeMemoir ? 'is-active' : ''} type="button" onClick={() => setActiveMemoir('')} aria-pressed={!activeMemoir}>
-              <span><strong>Toutes les références</strong><small>Corpus complet</small></span>
+            <button className={!activeCollection ? 'is-active' : ''} type="button" onClick={() => setActiveCollection('')} aria-pressed={!activeCollection}>
+              <span><strong>Toutes les références</strong><small>Collection complète</small></span>
               <em>{referenceCount}</em>
             </button>
             {memoirs.map((memoir) => {
-              const display = memoirDisplay(memoir.name);
+              const display = collectionDisplay(memoir.name);
               return (
                 <button
-                  className={activeMemoir === memoir.key ? 'is-active' : ''}
+                  className={activeCollection === memoir.key ? 'is-active' : ''}
                   key={memoir.key}
                   type="button"
-                  onClick={() => setActiveMemoir(memoir.key)}
-                  aria-pressed={activeMemoir === memoir.key}
+                  onClick={() => setActiveCollection(memoir.key)}
+                  aria-pressed={activeCollection === memoir.key}
                 >
                   <span><strong>{display.primary}</strong><small>{display.secondary}</small></span>
                   <em>{memoir.referenceCount}</em>
@@ -1290,6 +1307,7 @@ function DetailPanel({ reference, suggestions, onSelect, onCollectionSelect, onC
   const type = supportType(reference);
   const embedSrc = reference.embed?.src || (type === 'web' && href ? href : '');
   const embedHtml = embedSrc ? '' : reference.embed?.html || '';
+  const physicalSize = formatPhysicalSize(reference.physicalSize);
   const prefersCover = assetKind === 'cover' && ['book', 'chapter', 'thesis'].includes(type);
   const canEmbed = !prefersCover && Boolean(embedSrc || embedHtml);
   const siteEmbed = canEmbed && type === 'web';
@@ -1341,7 +1359,7 @@ function DetailPanel({ reference, suggestions, onSelect, onCollectionSelect, onC
                     onClick={() => memoirKey && onCollectionSelect?.(memoirKey)}
                     disabled={!memoirKey}
                   >
-                    {memoirReaderLabel(name)}
+                    {collectionReaderLabel(name)}
                   </button>
                 );
               })}
@@ -1419,6 +1437,7 @@ function DetailPanel({ reference, suggestions, onSelect, onCollectionSelect, onC
             {reference.publicationTitle && <><dt>Revue</dt><dd>{reference.publicationTitle}</dd></>}
             {reference.bookTitle && <><dt>Dans</dt><dd>{reference.bookTitle}</dd></>}
             {reference.isbn && <><dt>ISBN</dt><dd>{reference.isbn}</dd></>}
+            {physicalSize && <><dt>Format</dt><dd>{physicalSize}</dd></>}
             {reference.doi && <><dt>DOI</dt><dd>{reference.doi}</dd></>}
             {reference.cover?.attribution && (
               <>
@@ -1456,15 +1475,22 @@ function normalizeCatalogIndexLabels(index) {
       ...collection,
       label: collection.label || collection.id || 'Collection',
     })),
-    years: (index.years || []).map((year) => ({ ...year, label: year.label || year.id || 'Collection' })),
   };
 }
 
 function collectionOptions(index) {
-  const collections = catalogEntries(index);
-  const allStats = collections.reduce((stats, collection) => ({
+  const collections = catalogEntries(index)
+    .filter((collection) => (collection.stats?.referenceCount || 0) > 0);
+  const summedStats = collections.reduce((stats, collection) => ({
     referenceCount: stats.referenceCount + (collection.stats?.referenceCount || 0),
   }), { referenceCount: 0 });
+  const indexedReferenceCount = Number(index?.stats?.referenceCount);
+  const allStats = {
+    ...summedStats,
+    referenceCount: Number.isFinite(indexedReferenceCount) && indexedReferenceCount > 0
+      ? indexedReferenceCount
+      : summedStats.referenceCount,
+  };
   return [
     {
       id: ALL_COLLECTIONS_ID,
@@ -1483,6 +1509,20 @@ async function loadCatalogEntry(entry) {
   const payload = await response.json();
   catalogCache.set(cacheKey, payload);
   return payload;
+}
+
+async function findRootForHashToken(index, token) {
+  if (!token) return '';
+  const entries = catalogEntries(index);
+  const availableRoots = new Set(entries.map((entry) => entry.id));
+  const indexedRoot = indexedRootsForHashToken(index, token)
+    .find((root) => availableRoots.has(root));
+  if (indexedRoot) return indexedRoot;
+  for (const entry of entries) {
+    const catalog = await loadCatalogEntry(entry);
+    if (findReferenceByHashToken(catalog.references || [], token)) return entry.id;
+  }
+  return '';
 }
 
 function mergeMemoirMemberships(existing, incoming) {
@@ -1508,10 +1548,13 @@ function aggregateCatalogs(index, catalogs) {
         referencesByKey.set(reference.key, { ...reference });
         return;
       }
+      const membership = mergeMemoirMemberships(previous, reference);
       referencesByKey.set(reference.key, {
         ...previous,
         tags: Array.from(new Set([...(previous.tags || []), ...(reference.tags || [])])),
-        ...mergeMemoirMemberships(previous, reference),
+        ...membership,
+        collectionKeys: membership.memoirKeys,
+        collectionNames: membership.memoirNames,
       });
     });
   });
@@ -1519,7 +1562,7 @@ function aggregateCatalogs(index, catalogs) {
   const references = Array.from(referencesByKey.values());
   const memoirsByKey = new Map();
   catalogs.forEach((catalog) => {
-    (catalog.memoirs || []).forEach((memoir) => {
+    (catalog.collections || catalog.memoirs || []).forEach((memoir) => {
       if (!memoirsByKey.has(memoir.key)) memoirsByKey.set(memoir.key, { ...memoir });
     });
   });
@@ -1540,6 +1583,23 @@ function aggregateCatalogs(index, catalogs) {
     .filter(Boolean)
     .sort()
     .at(-1);
+  const sharedReferences = references
+    .filter((reference) => (reference.memoirKeys || []).length > 1)
+    .sort((left, right) => (
+      (right.memoirKeys || []).length - (left.memoirKeys || []).length
+      || left.title.localeCompare(right.title, 'fr')
+    ))
+    .map((reference) => ({
+      key: reference.key,
+      title: reference.title,
+      creatorsLabel: reference.creatorsLabel,
+      year: reference.year,
+      memoirKeys: reference.memoirKeys || [],
+      memoirNames: reference.memoirNames || [],
+      collectionKeys: reference.collectionKeys || reference.memoirKeys || [],
+      collectionNames: reference.collectionNames || reference.memoirNames || [],
+      count: (reference.memoirKeys || []).length,
+    }));
   const first = catalogs[0] || {};
   return {
     generatedAt,
@@ -1549,28 +1609,30 @@ function aggregateCatalogs(index, catalogs) {
       rootCollectionName: 'Toutes les collections',
       rootCollectionUrl: first.source?.groupUrl,
       rootId: ALL_COLLECTIONS_ID,
-      yearId: ALL_COLLECTIONS_ID,
     },
+    physicalScale: Boolean(index?.physicalScale),
     stats: {
       referenceCount: references.length,
       memoirCount: memoirs.length,
-      sharedReferenceCount: references.filter((reference) => (reference.memoirKeys || []).length > 1).length,
+      collectionCount: memoirs.length,
+      sharedReferenceCount: sharedReferences.length,
       annotationCount: references.reduce((sum, reference) => sum + (reference.annotations?.count || 0), 0),
       noteCount: references.reduce((sum, reference) => sum + (reference.notes?.length || 0), 0),
-      attachmentCount: references.filter((reference) => reference.asset?.src || reference.embed?.src || reference.url).length,
+      attachmentCount: references.reduce((sum, reference) => sum + (reference.attachments?.count || 0), 0),
       coverCoverage: {
         bySource: coverSources,
       },
     },
     layout: DEFAULT_LAYOUT,
     memoirs,
+    collections: memoirs,
     references,
-    sharedReferences: references.filter((reference) => (reference.memoirKeys || []).length > 1).map((reference) => reference.key),
+    sharedReferences,
   };
 }
 
-async function loadCatalogForYear(index, yearId) {
-  if (yearId === ALL_COLLECTIONS_ID) {
+async function loadCatalogForRoot(index, rootIdValue) {
+  if (rootIdValue === ALL_COLLECTIONS_ID) {
     const entries = catalogEntries(index);
     const cacheKey = `${ALL_COLLECTIONS_ID}:${entries.map((entry) => entry.catalog).join('|')}`;
     if (catalogCache.has(cacheKey)) return catalogCache.get(cacheKey);
@@ -1579,47 +1641,17 @@ async function loadCatalogForYear(index, yearId) {
     catalogCache.set(cacheKey, payload);
     return payload;
   }
-  const entry = catalogEntries(index).find((collection) => collection.id === yearId);
-  if (!entry) throw new Error(`Collection inconnue : ${yearId}`);
+  const entry = catalogEntries(index).find((collection) => collection.id === rootIdValue);
+  if (!entry) throw new Error(`Collection inconnue : ${rootIdValue}`);
   return loadCatalogEntry(entry);
-}
-
-function legacyCatalogIndex(catalog) {
-  const yearId = catalog.source?.rootId
-    || catalog.source?.yearId
-    || catalog.source?.rootCollectionName?.match(/(\d{4}-\d{2,4})/u)?.[1]
-    || 'courant';
-  const entry = {
-    id: yearId,
-    label: catalog.source?.rootCollectionName || 'Collection',
-    catalog: 'data/catalog.json',
-    rootCollectionUrl: catalog.source?.rootCollectionUrl,
-    stats: catalog.stats,
-    generatedAt: catalog.generatedAt,
-  };
-  catalogCache.set(entry.catalog, catalog);
-  return {
-    generatedAt: catalog.generatedAt,
-    defaultRoot: yearId,
-    defaultYear: yearId,
-    group: {
-      id: catalog.source?.groupId,
-      name: catalog.source?.groupName,
-      url: catalog.source?.groupUrl,
-    },
-    collections: [entry],
-    years: [entry],
-    referenceCollections: Object.fromEntries((catalog.references || []).map((reference) => [reference.key, [yearId]])),
-    referenceYears: Object.fromEntries((catalog.references || []).map((reference) => [reference.key, [yearId]])),
-  };
 }
 
 export default function App() {
   const [catalog, setCatalog] = useState(null);
   const [catalogIndex, setCatalogIndex] = useState(null);
-  const [activeYear, setActiveYear] = useState('');
+  const [activeRoot, setActiveRoot] = useState('');
   const [error, setError] = useState('');
-  const [activeMemoir, setActiveMemoir] = useState('');
+  const [activeCollection, setActiveCollection] = useState('');
   const [query, setQuery] = useState('');
   const [typeFilter, setTypeFilter] = useState('');
   const [yearFilter, setYearFilter] = useState('');
@@ -1634,24 +1666,18 @@ export default function App() {
   const [transformState, setTransformState] = useState({ scale: 1, positionX: 0, positionY: 0 });
   const [viewport, setViewport] = useState({ width: 1280, height: 720 });
   const [measuredAssetRatios, setMeasuredAssetRatios] = useState(() => new Map());
-  const activeYearRef = useRef('');
+  const activeRootRef = useRef('');
 
   useEffect(() => {
     let cancelled = false;
     async function loadIndex() {
       try {
         const response = await fetch(`${BASE_URL}data/catalog-index.json`);
-        if (response.ok) {
-          const payload = await response.json();
-          if (!cancelled) setCatalogIndex(normalizeCatalogIndexLabels(payload));
-          return;
-        }
-        const legacyResponse = await fetch(`${BASE_URL}data/catalog.json`);
-        if (!legacyResponse.ok) throw new Error(`catalog.json ${legacyResponse.status}`);
-        const legacyCatalog = await legacyResponse.json();
-        if (!cancelled) setCatalogIndex(legacyCatalogIndex(legacyCatalog));
+        if (!response.ok) throw new Error(`catalog-index.json ${response.status}`);
+        const payload = await response.json();
+        if (!cancelled) setCatalogIndex(normalizeCatalogIndexLabels(payload));
       } catch (loadError) {
-      if (!cancelled) setError(loadError.message || 'Chargement impossible');
+        if (!cancelled) setError(loadError.message || 'Chargement impossible');
       }
     }
     loadIndex();
@@ -1676,18 +1702,17 @@ export default function App() {
       const currentRequest = ++requestId;
       const next = readViewParams();
       const hashToken = referenceTokenFromHash();
-      const availableYears = new Set([ALL_COLLECTIONS_ID, ...catalogEntries(catalogIndex).map((collection) => collection.id)]);
-      const referenceYears = referenceCatalogsForHashToken(catalogIndex, hashToken);
-      const requestedYear = availableYears.has(next.year) ? next.year : '';
-      const targetYear = requestedYear
-        || referenceYears.find((year) => availableYears.has(year))
-        || defaultCatalogId(catalogIndex);
+      const availableRoots = new Set([ALL_COLLECTIONS_ID, ...catalogEntries(catalogIndex).map((collection) => collection.id)]);
+      const requestedRoot = availableRoots.has(next.root) ? next.root : '';
 
       try {
-        const payload = await loadCatalogForYear(catalogIndex, targetYear);
+        const targetRoot = requestedRoot
+          || await findRootForHashToken(catalogIndex, hashToken)
+          || defaultRootId(catalogIndex);
+        const payload = await loadCatalogForRoot(catalogIndex, targetRoot);
         if (cancelled || currentRequest !== requestId) return;
-        activeYearRef.current = targetYear;
-        setActiveYear(targetYear);
+        activeRootRef.current = targetRoot;
+        setActiveRoot(targetRoot);
         setCatalog(payload);
         setError('');
         setToolsOpen(false);
@@ -1695,7 +1720,7 @@ export default function App() {
         setFocusReferenceKey('');
         setViewMode(next.view);
         setListSort(next.sort);
-        setActiveMemoir(next.memoir);
+        setActiveCollection(next.collection);
         setQuery(next.query);
         setTypeFilter(next.type);
         setYearFilter(next.pubYear);
@@ -1708,14 +1733,14 @@ export default function App() {
           state: {
             view: next.view,
             sort: next.sort,
-            year: targetYear,
-            memoir: next.memoir,
+            root: targetRoot,
+            collection: next.collection,
             query: next.query,
             type: next.type,
             pubYear: next.pubYear,
             featureFilters: next.featureFilters,
           },
-          defaultYear: defaultCatalogId(catalogIndex),
+          defaultRoot: defaultRootId(catalogIndex),
           historyMode: 'replace',
           detailEntry: Boolean(reference && window.history.state?.zotscapeDetailEntry),
         });
@@ -1749,7 +1774,7 @@ export default function App() {
   const filteredReferences = useMemo(() => {
     const search = normalize(query);
     return references.filter((reference) => {
-      if (activeMemoir && !reference.memoirKeys?.includes(activeMemoir)) return false;
+      if (activeCollection && !reference.memoirKeys?.includes(activeCollection)) return false;
       if (typeFilter && reference.itemType !== typeFilter) return false;
       if (yearFilter && reference.year !== yearFilter) return false;
       if (search && !getSearchBlob(reference).includes(search)) return false;
@@ -1758,7 +1783,7 @@ export default function App() {
       }
       return true;
     });
-  }, [activeMemoir, featureFilters, query, references, typeFilter, yearFilter]);
+  }, [activeCollection, featureFilters, query, references, typeFilter, yearFilter]);
 
   const recentKeys = useMemo(() => new Set(
     [...references]
@@ -1770,13 +1795,14 @@ export default function App() {
     references.filter((reference) => reference.memoirKeys?.length > 1).map((reference) => reference.key),
   ), [references]);
   const sharedOnly = featureFilters.has('shared');
+  const physicalScale = Boolean(catalog?.physicalScale ?? catalogIndex?.physicalScale);
   const sortedListReferences = useMemo(
     () => sortListReferences(filteredReferences, listSort),
     [filteredReferences, listSort],
   );
   const packed = useMemo(
-    () => packReferences(filteredReferences, viewport, recentKeys, sharedKeys, sharedOnly, measuredAssetRatios),
-    [filteredReferences, measuredAssetRatios, recentKeys, sharedKeys, sharedOnly, viewport],
+    () => packReferences(filteredReferences, viewport, recentKeys, sharedKeys, sharedOnly, measuredAssetRatios, physicalScale),
+    [filteredReferences, measuredAssetRatios, physicalScale, recentKeys, sharedKeys, sharedOnly, viewport],
   );
   const visibleItems = packed.items;
   const layout = packed.layout || catalog?.layout || DEFAULT_LAYOUT;
@@ -1828,11 +1854,11 @@ export default function App() {
     [references, selectedReference],
   );
   const activeSubcollection = useMemo(
-    () => memoirs.find((memoir) => memoir.key === activeMemoir) || null,
-    [activeMemoir, memoirs],
+    () => memoirs.find((memoir) => memoir.key === activeCollection) || null,
+    [activeCollection, memoirs],
   );
-  const activeSubcollectionLabel = activeSubcollection ? memoirReaderLabel(activeSubcollection.name) : '';
-  const toolCount = activeToolCount({ activeMemoir, query, typeFilter, yearFilter, featureFilters });
+  const activeSubcollectionLabel = activeSubcollection ? collectionReaderLabel(activeSubcollection.name) : '';
+  const toolCount = activeToolCount({ activeCollection, query, typeFilter, yearFilter, featureFilters });
   const focusItem = useMemo(
     () => visibleItems.find(({ reference }) => reference.key === focusReferenceKey) || null,
     [focusReferenceKey, visibleItems],
@@ -1841,8 +1867,8 @@ export default function App() {
   const currentUrlState = () => ({
     view: viewMode,
     sort: listSort,
-    year: activeYear,
-    memoir: activeMemoir,
+    root: activeRoot,
+    collection: activeCollection,
     query,
     type: typeFilter,
     pubYear: yearFilter,
@@ -1850,15 +1876,15 @@ export default function App() {
   });
 
   useEffect(() => {
-    if (!catalog || !catalogIndex || !activeYear) return;
+    if (!catalog || !catalogIndex || !activeRoot) return;
     writeAppUrl({
       reference: selectedReference,
       state: currentUrlState(),
-      defaultYear: defaultCatalogId(catalogIndex),
+      defaultRoot: defaultRootId(catalogIndex),
       historyMode: 'replace',
       detailEntry: Boolean(selectedReference && window.history.state?.zotscapeDetailEntry),
     });
-  }, [activeMemoir, activeYear, catalog, catalogIndex, featureFilters, listSort, query, selectedReference, typeFilter, viewMode, yearFilter]);
+  }, [activeCollection, activeRoot, catalog, catalogIndex, featureFilters, listSort, query, selectedReference, typeFilter, viewMode, yearFilter]);
 
   useEffect(() => {
     setTransformState((current) => ({ ...current, scale: fixedScale }));
@@ -1870,12 +1896,12 @@ export default function App() {
       writeAppUrl({
         reference: null,
         state: currentUrlState(),
-        defaultYear: defaultCatalogId(catalogIndex),
+        defaultRoot: defaultRootId(catalogIndex),
         historyMode: 'replace',
         detailEntry: false,
       });
     }
-  }, [activeYear, catalogIndex, filteredReferences, selectedReference]);
+  }, [activeRoot, catalogIndex, filteredReferences, selectedReference]);
 
   useEffect(() => {
     if (viewMode !== 'atlas') return undefined;
@@ -1911,7 +1937,7 @@ export default function App() {
   }, [fixedScale, layout.height, layout.width, viewMode, visibleItems.length]);
 
   function resetTools() {
-    setActiveMemoir('');
+    setActiveCollection('');
     setQuery('');
     setTypeFilter('');
     setYearFilter('');
@@ -1920,13 +1946,13 @@ export default function App() {
 
   function selectCollectionFilter(memoirKey) {
     if (!memoirKey) return;
-    setActiveMemoir(memoirKey);
+    setActiveCollection(memoirKey);
     setToolsOpen(false);
     setAboutOpen(false);
     writeAppUrl({
       reference: selectedReference,
-      state: { ...currentUrlState(), memoir: memoirKey },
-      defaultYear: defaultCatalogId(catalogIndex),
+      state: { ...currentUrlState(), collection: memoirKey },
+      defaultRoot: defaultRootId(catalogIndex),
       historyMode: 'replace',
       detailEntry: Boolean(selectedReference && window.history.state?.zotscapeDetailEntry),
     });
@@ -1949,7 +1975,7 @@ export default function App() {
     writeAppUrl({
       reference: selectedReference,
       state: { ...currentUrlState(), view: nextView },
-      defaultYear: defaultCatalogId(catalogIndex),
+      defaultRoot: defaultRootId(catalogIndex),
       historyMode: selectedReference ? 'replace' : 'push',
       detailEntry: Boolean(selectedReference && window.history.state?.zotscapeDetailEntry),
     });
@@ -1961,20 +1987,20 @@ export default function App() {
     writeAppUrl({
       reference: selectedReference,
       state: { ...currentUrlState(), sort: nextSort },
-      defaultYear: defaultCatalogId(catalogIndex),
+      defaultRoot: defaultRootId(catalogIndex),
       historyMode: 'replace',
       detailEntry: Boolean(selectedReference && window.history.state?.zotscapeDetailEntry),
     });
   }
 
-  async function changeCatalogYear(nextYear) {
-    if (!catalogIndex || nextYear === activeYear) return;
+  async function changeCatalogRoot(nextRoot) {
+    if (!catalogIndex || nextRoot === activeRoot) return;
     try {
-      const payload = await loadCatalogForYear(catalogIndex, nextYear);
+      const payload = await loadCatalogForRoot(catalogIndex, nextRoot);
       resetTools();
       setCatalog(payload);
-      setActiveYear(nextYear);
-      activeYearRef.current = nextYear;
+      setActiveRoot(nextRoot);
+      activeRootRef.current = nextRoot;
       setSelectedReference(null);
       setFocusReferenceKey('');
       setToolsOpen(false);
@@ -1984,14 +2010,14 @@ export default function App() {
         state: {
           view: viewMode,
           sort: listSort,
-          year: nextYear,
-          memoir: '',
+          root: nextRoot,
+          collection: '',
           query: '',
           type: '',
           pubYear: '',
           featureFilters: new Set(),
         },
-        defaultYear: defaultCatalogId(catalogIndex),
+        defaultRoot: defaultRootId(catalogIndex),
         historyMode: 'push',
         detailEntry: false,
       });
@@ -2006,7 +2032,7 @@ export default function App() {
     writeAppUrl({
       reference,
       state: currentUrlState(),
-      defaultYear: defaultCatalogId(catalogIndex),
+      defaultRoot: defaultRootId(catalogIndex),
       historyMode: replacing ? 'replace' : 'push',
       detailEntry: replacing ? Boolean(window.history.state?.zotscapeDetailEntry) : true,
     });
@@ -2022,7 +2048,7 @@ export default function App() {
     writeAppUrl({
       reference: null,
       state: currentUrlState(),
-      defaultYear: defaultCatalogId(catalogIndex),
+      defaultRoot: defaultRootId(catalogIndex),
       historyMode: 'replace',
       detailEntry: false,
     });
@@ -2079,12 +2105,11 @@ export default function App() {
     <main className="app-shell">
       <header className="atlas-header">
         <div className="atlas-heading">
-          <a className="brand-link" href={BASE_URL}>
+          <a className="brand-link" href={BASE_URL} aria-label="EnsadNancy">
             <Library size={17} aria-hidden="true" />
-            <span>EnsadNancy</span>
           </a>
           <div className="atlas-title">
-            <CollectionSelector activeCollection={activeYear} collections={rootCollections} onChange={changeCatalogYear} />
+            <CollectionSelector activeCollection={activeRoot} collections={rootCollections} onChange={changeCatalogRoot} />
             {activeSubcollectionLabel && (
               <p className="atlas-subtitle">Sous-collection · {activeSubcollectionLabel}</p>
             )}
@@ -2127,7 +2152,7 @@ export default function App() {
       {filteredReferences.length ? (
         viewMode === 'atlas' ? (
           <TransformWrapper
-            key={`${activeYear}-${Math.round(fixedScale * 100)}-${layout.width}-${layout.height}-${filteredReferences.map((reference) => reference.key).join('-')}`}
+            key={`${activeRoot}-${Math.round(fixedScale * 100)}-${layout.width}-${layout.height}-${filteredReferences.map((reference) => reference.key).join('-')}`}
             initialScale={fixedScale}
             minScale={fixedScale}
             maxScale={fixedScale}
@@ -2190,8 +2215,8 @@ export default function App() {
       <ToolPanel
         open={toolsOpen}
         memoirs={memoirs}
-        activeMemoir={activeMemoir}
-        setActiveMemoir={setActiveMemoir}
+        activeCollection={activeCollection}
+        setActiveCollection={setActiveCollection}
         query={query}
         setQuery={setQuery}
         typeFilter={typeFilter}

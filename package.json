@@ -8,7 +8,9 @@
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1",
     "collect": "node scripts/collect-zotero.mjs",
-    "collect:fast": "ZOTSCAPE_SKIP_SCREENSHOTS=1 node scripts/collect-zotero.mjs"
+    "collect:fast": "ZOTSCAPE_SKIP_SCREENSHOTS=1 node scripts/collect-zotero.mjs",
+    "audit:data": "node scripts/audit-data.mjs",
+    "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^4.3.4",

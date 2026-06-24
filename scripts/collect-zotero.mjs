@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
+import { auditData, pruneUnreferencedMedia } from './audit-data.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, '..');
@@ -16,6 +17,7 @@ const previewDir = path.join(mediaDir, 'previews');
 const screenshotDir = path.join(mediaDir, 'screenshots');
 const fallbackDir = path.join(mediaDir, 'fallbacks');
 const cacheDir = path.join(projectRoot, '.cache');
+const configFile = path.join(projectRoot, 'zotscape.config.json');
 const assetCacheFile = path.join(cacheDir, 'zotscape-assets.json');
 const zoteroCacheFile = path.join(cacheDir, 'zotscape-zotero.json');
 const execFileAsync = promisify(execFile);
@@ -46,9 +48,6 @@ async function loadLocalEnvFiles() {
 
 await loadLocalEnvFiles();
 
-const GROUP_ID = Number(process.env.ZOTSCAPE_ZOTERO_GROUP_ID || 6584095);
-const ROOT_COLLECTION_FILTER = process.env.ZOTSCAPE_ROOT_COLLECTION_FILTER
-  || (process.env.ZOTSCAPE_USE_ROOT_COLLECTION_FILTER === '1' ? process.env.ZOTSCAPE_ROOT_COLLECTION || '' : '');
 const API_BASE = 'https://api.zotero.org';
 const PAGE_SIZE = 100;
 const SCREENSHOT_LIMIT = Math.max(0, Number(process.env.ZOTSCAPE_SCREENSHOT_LIMIT || 18));
@@ -56,11 +55,13 @@ const SKIP_SCREENSHOTS = process.env.ZOTSCAPE_SKIP_SCREENSHOTS === '1';
 const GOOGLE_BOOKS_API_KEY = process.env.GOOGLE_BOOKS_API_KEY || '';
 const USE_PUBLIC_GOOGLE_BOOKS = process.env.ZOTSCAPE_ENABLE_GOOGLE_BOOKS_PUBLIC === '1';
 const ISBNDB_API_KEY = process.env.ISBNDB_API_KEY || '';
-const COVER_PIPELINE_VERSION = 4;
+const MEDIA_PIPELINE_VERSION = 5;
+const COVER_PIPELINE_VERSION = MEDIA_PIPELINE_VERSION;
 const COVER_FAILURE_CACHE_MS = 20 * 60 * 60 * 1000;
 const WEB_CACHE_TTL_MS = envInteger('ZOTSCAPE_WEB_CACHE_TTL_HOURS', 168, 0, 24 * 365) * 60 * 60 * 1000;
 const MAX_WEB_CACHE_HTML_CHARS = envInteger('ZOTSCAPE_WEB_CACHE_HTML_CHARS', 350_000, 0, 2_000_000);
 const VALIDATE_CACHE_ASSETS = process.env.ZOTSCAPE_VALIDATE_CACHE_ASSETS === '1';
+const PRUNE_MEDIA = process.env.ZOTSCAPE_PRUNE_MEDIA === '1';
 const ZOTERO_PAGE_CONCURRENCY = envInteger('ZOTSCAPE_ZOTERO_PAGE_CONCURRENCY', 2, 1, 6);
 const ENRICH_CONCURRENCY = envInteger('ZOTSCAPE_ENRICH_CONCURRENCY', 4, 1, 10);
 const SCREENSHOT_CONCURRENCY = envInteger('ZOTSCAPE_SCREENSHOT_CONCURRENCY', 2, 1, 4);
@@ -68,6 +69,10 @@ const SCREENSHOT_ATTEMPT_LIMIT = envInteger('ZOTSCAPE_SCREENSHOT_ATTEMPT_LIMIT',
 const MAX_PUBLIC_PDF_BYTES = 50 * 1024 * 1024;
 const ATLAS_WIDTH = 3200;
 const ATLAS_HEIGHT = 2200;
+const IMAGE_OUTPUT_SPECS = {
+  cover: { width: 1200, height: 1800, quality: 84 },
+  preview: { width: 1200, height: 760, quality: 76 },
+};
 
 const EXCLUDED_ITEM_TYPES = new Set(['attachment', 'note', 'annotation']);
 const WEB_CAPTURE_TYPES = new Set([
@@ -91,6 +96,7 @@ const CATALOG_ENRICHMENT_FIELDS = [
   'screenshot',
   'asset',
   'previewStatus',
+  'physicalSize',
 ];
 
 const TYPE_LABELS = {
@@ -152,8 +158,48 @@ const BLOCKED_PATTERNS = [
   /unusual traffic/iu,
 ];
 
-function zoteroPrefix() {
-  return `${API_BASE}/groups/${GROUP_ID}`;
+function rootId(groupId, collectionKey) {
+  return `${Number(groupId)}:${collectionKey}`;
+}
+
+function scopedItemKey(groupId, itemKey) {
+  return `${Number(groupId)}-${itemKey}`;
+}
+
+function safeFilePart(value) {
+  return String(value || 'item').replace(/[^a-z0-9._-]+/giu, '-');
+}
+
+async function loadZotscapeConfig() {
+  const config = await readJson(configFile, null);
+  if (!config || typeof config !== 'object') {
+    throw new Error('zotscape.config.json manquant ou invalide.');
+  }
+  const sources = Array.isArray(config.sources) ? config.sources : [];
+  const normalizedSources = sources
+    .map((source) => ({
+      groupId: Number(source.groupId),
+      label: normalizeSpace(source.label || ''),
+    }))
+    .filter((source) => Number.isInteger(source.groupId) && source.groupId > 0);
+  if (!normalizedSources.length) {
+    throw new Error('zotscape.config.json doit déclarer au moins une source Zotero.');
+  }
+  const defaultGroupId = Number(config.defaultRoot?.groupId);
+  const defaultCollectionKey = normalizeSpace(config.defaultRoot?.collectionKey || '');
+  const defaultRoot = Number.isInteger(defaultGroupId) && defaultGroupId > 0 && defaultCollectionKey
+    ? rootId(defaultGroupId, defaultCollectionKey)
+    : '';
+  return {
+    ...config,
+    sources: normalizedSources,
+    defaultRoot,
+    physicalScale: config.physicalScale !== false,
+  };
+}
+
+function zoteroPrefix(groupId) {
+  return `${API_BASE}/groups/${groupId}`;
 }
 
 function log(message) {
@@ -297,8 +343,8 @@ async function fetchWithRetry(url, options = {}, attempts = 3) {
   throw lastError || new Error(`Fetch failed for ${url}`);
 }
 
-async function zoteroPage(pathname, params = {}, start = 0) {
-  const url = new URL(`${zoteroPrefix()}${pathname}`);
+async function zoteroPage(groupId, pathname, params = {}, start = 0) {
+  const url = new URL(`${zoteroPrefix(groupId)}${pathname}`);
   url.searchParams.set('v', '3');
   url.searchParams.set('format', 'json');
   url.searchParams.set('limit', String(PAGE_SIZE));
@@ -323,8 +369,8 @@ async function zoteroPage(pathname, params = {}, start = 0) {
   };
 }
 
-async function zoteroAll(pathname, params = {}) {
-  const firstPage = await zoteroPage(pathname, params, 0);
+async function zoteroAll(groupId, pathname, params = {}) {
+  const firstPage = await zoteroPage(groupId, pathname, params, 0);
   const all = Array.isArray(firstPage.items) ? [...firstPage.items] : [];
   const total = firstPage.total || all.length;
   let libraryVersion = firstPage.libraryVersion || null;
@@ -334,7 +380,7 @@ async function zoteroAll(pathname, params = {}) {
   for (let start = all.length; start < total; start += PAGE_SIZE) {
     starts.push(start);
   }
-  const pages = await mapLimit(starts, ZOTERO_PAGE_CONCURRENCY, (start) => zoteroPage(pathname, params, start));
+  const pages = await mapLimit(starts, ZOTERO_PAGE_CONCURRENCY, (start) => zoteroPage(groupId, pathname, params, start));
   for (const page of pages) {
     if (!libraryVersion && page.libraryVersion) {
       libraryVersion = page.libraryVersion;
@@ -344,9 +390,9 @@ async function zoteroAll(pathname, params = {}) {
   return { items: all, libraryVersion };
 }
 
-async function zoteroDeletedSince(libraryVersion) {
+async function zoteroDeletedSince(groupId, libraryVersion) {
   if (!libraryVersion) return null;
-  const url = new URL(`${zoteroPrefix()}/deleted`);
+  const url = new URL(`${zoteroPrefix(groupId)}/deleted`);
   url.searchParams.set('v', '3');
   url.searchParams.set('since', String(libraryVersion));
   const response = await fetchWithRetry(url, {
@@ -369,19 +415,20 @@ function isUsableZoteroCache(section) {
     && Number.isFinite(Number(section.libraryVersion));
 }
 
-async function zoteroAllCached(cache, cacheKey, pathname, params = {}, deletedField = cacheKey) {
-  const cached = cache[cacheKey];
+async function zoteroAllCached(cache, groupId, cacheKey, pathname, params = {}, deletedField = cacheKey) {
+  const scopedCacheKey = `${groupId}:${cacheKey}`;
+  const cached = cache[scopedCacheKey];
   if (!isUsableZoteroCache(cached)) {
-    const result = await zoteroAll(pathname, params);
-    cache[cacheKey] = result;
+    const result = await zoteroAll(groupId, pathname, params);
+    cache[scopedCacheKey] = result;
     return result;
   }
 
   try {
     const since = Number(cached.libraryVersion);
     const [changes, deletedResult] = await Promise.all([
-      zoteroAll(pathname, { ...params, since }),
-      zoteroDeletedSince(since),
+      zoteroAll(groupId, pathname, { ...params, since }),
+      zoteroDeletedSince(groupId, since),
     ]);
     const byKey = new Map(cached.items.filter((item) => item?.key).map((item) => [item.key, item]));
     for (const item of changes.items || []) {
@@ -393,17 +440,17 @@ async function zoteroAllCached(cache, cacheKey, pathname, params = {}, deletedFi
       items: [...byKey.values()],
       libraryVersion: Number(changes.libraryVersion || deletedResult?.libraryVersion || cached.libraryVersion) || cached.libraryVersion,
     };
-    cache[cacheKey] = result;
+    cache[scopedCacheKey] = result;
     if ((changes.items || []).length || deletedKeys.size) {
-      log(`Updated Zotero ${cacheKey}: ${changes.items.length} changed, ${deletedKeys.size} deleted.`);
+      log(`Updated Zotero ${groupId}/${cacheKey}: ${changes.items.length} changed, ${deletedKeys.size} deleted.`);
     } else {
-      log(`Reused Zotero ${cacheKey} cache at version ${result.libraryVersion}.`);
+      log(`Reused Zotero ${groupId}/${cacheKey} cache at version ${result.libraryVersion}.`);
     }
     return result;
   } catch (error) {
-    log(`Zotero ${cacheKey} incremental cache ignored: ${error.message}`);
-    const result = await zoteroAll(pathname, params);
-    cache[cacheKey] = result;
+    log(`Zotero ${groupId}/${cacheKey} incremental cache ignored: ${error.message}`);
+    const result = await zoteroAll(groupId, pathname, params);
+    cache[scopedCacheKey] = result;
     return result;
   }
 }
@@ -447,13 +494,39 @@ function slugify(value) {
     .slice(0, 80) || 'item';
 }
 
-function rootCollectionDescriptor(rootCollection) {
+function hashSlug(value, fallback = '') {
+  return String(value || fallback)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/gu, '')
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/gu, '-')
+    .replace(/^-+|-+$/gu, '')
+    .slice(0, 72)
+    .replace(/-+$/gu, '');
+}
+
+function referenceLookupKeys(reference) {
+  return [...new Set([
+    reference.key,
+    reference.zoteroKey,
+    reference.citationKey,
+    hashSlug(reference.key),
+    hashSlug(reference.zoteroKey),
+    hashSlug(reference.citationKey),
+  ].map((value) => String(value || '').trim()).filter(Boolean))];
+}
+
+function rootCollectionDescriptor(rootCollection, source) {
   const label = normalizeSpace(rootCollection.data?.name || rootCollection.key);
   if (!label) return null;
   return {
-    id: rootCollection.key,
+    id: rootId(source.groupId, rootCollection.key),
     label,
     slug: slugify(label),
+    groupId: source.groupId,
+    groupLabel: source.label,
+    collectionKey: rootCollection.key,
   };
 }
 
@@ -525,6 +598,57 @@ function extractCitationKey(item) {
 function extractCoverUrl(extra) {
   const match = String(extra || '').match(/^\s*(?:cover|cover\s*url|cover\s*image|image\s*cover)\s*:\s*(https?:\/\/\S+)\s*$/imu);
   return publicUrl(match?.[1] || '');
+}
+
+function unitToMillimeters(value, unit) {
+  const number = Number(String(value || '').replace(',', '.'));
+  if (!Number.isFinite(number) || number <= 0) return null;
+  const normalizedUnit = String(unit || 'mm').toLowerCase();
+  if (normalizedUnit.startsWith('cm')) return number * 10;
+  if (normalizedUnit === 'in' || normalizedUnit.startsWith('inch') || normalizedUnit.startsWith('po')) return number * 25.4;
+  return number;
+}
+
+function parsePhysicalDimensions(value, source = '') {
+  const text = normalizeSpace(value)
+    .replace(/[×✕]/gu, 'x')
+    .replace(/\bby\b/giu, 'x');
+  if (!text) return null;
+  const match = text.match(/(\d+(?:[.,]\d+)?)\s*x\s*(\d+(?:[.,]\d+)?)(?:\s*x\s*(\d+(?:[.,]\d+)?))?\s*(mm|cm|in(?:ches)?|po(?:uces)?)?\b/iu);
+  if (!match) return null;
+  const unit = match[4] || (/[.,]/u.test(match[1] + match[2]) ? 'cm' : 'mm');
+  const widthMm = unitToMillimeters(match[1], unit);
+  const heightMm = unitToMillimeters(match[2], unit);
+  const depthMm = match[3] ? unitToMillimeters(match[3], unit) : null;
+  if (!widthMm || !heightMm) return null;
+  return {
+    widthMm: Math.round(widthMm),
+    heightMm: Math.round(heightMm),
+    ...(depthMm ? { depthMm: Math.round(depthMm) } : {}),
+    source,
+  };
+}
+
+function extractPhysicalSize(extra) {
+  const lines = String(extra || '').split(/\r?\n/u);
+  const keys = [
+    'physicalsize',
+    'physical size',
+    'dimensions',
+    'dimension',
+    'format',
+    'mesures',
+    'measurements',
+  ];
+  for (const line of lines) {
+    const [key, ...rest] = line.split(':');
+    if (!rest.length) continue;
+    const normalizedKey = normalizeSpace(key).toLowerCase();
+    if (!keys.includes(normalizedKey)) continue;
+    const size = parsePhysicalDimensions(rest.join(':'), 'zotero-extra');
+    if (size) return size;
+  }
+  return null;
 }
 
 function parseIsbns(value) {
@@ -792,6 +916,50 @@ async function fetchJson(url, options = {}) {
   return response.json().catch(() => null);
 }
 
+async function findOpenLibraryPhysicalSize(reference) {
+  for (const isbn of reference.isbns || []) {
+    const edition = await fetchJson(`https://openlibrary.org/isbn/${encodeURIComponent(isbn)}.json`, { attempts: 2 });
+    const size = parsePhysicalDimensions(edition?.physical_dimensions || '', 'openlibrary-isbn');
+    if (size) return size;
+  }
+  return null;
+}
+
+async function findGoogleBooksPhysicalSize(reference) {
+  if (!GOOGLE_BOOKS_API_KEY && !USE_PUBLIC_GOOGLE_BOOKS) return null;
+  for (const isbn of reference.isbns || []) {
+    const url = new URL('https://www.googleapis.com/books/v1/volumes');
+    url.searchParams.set('q', `isbn:${isbn}`);
+    url.searchParams.set('maxResults', '3');
+    url.searchParams.set('projection', 'full');
+    if (GOOGLE_BOOKS_API_KEY) url.searchParams.set('key', GOOGLE_BOOKS_API_KEY);
+    const payload = await fetchJson(url, { attempts: 2 });
+    const items = Array.isArray(payload?.items) ? payload.items : [];
+    for (const item of items) {
+      const info = item.volumeInfo || {};
+      const candidateIsbns = (info.industryIdentifiers || []).map((identifier) => identifier.identifier);
+      if (!hasReferenceIsbn(reference, candidateIsbns)) continue;
+      const size = parsePhysicalDimensions(info.dimensions || '', 'google-books-isbn');
+      if (size) return size;
+    }
+  }
+  return null;
+}
+
+async function enrichPhysicalSize(reference, assetCache) {
+  const extraSize = reference.physicalSize || null;
+  if (extraSize) return extraSize;
+  if (!COVER_OBJECT_TYPES.has(reference.itemType) || !(reference.isbns || []).length) return null;
+  assetCache.physicalSizes ||= {};
+  const cacheKey = `${reference.key}:${(reference.isbns || []).join(',')}`;
+  if (Object.hasOwn(assetCache.physicalSizes, cacheKey)) return assetCache.physicalSizes[cacheKey];
+  const size = await findOpenLibraryPhysicalSize(reference)
+    || await findGoogleBooksPhysicalSize(reference)
+    || null;
+  assetCache.physicalSizes[cacheKey] = size;
+  return size;
+}
+
 function wrapText(text, maxChars, maxLines) {
   const words = normalizeSpace(text).split(' ').filter(Boolean);
   const lines = [];
@@ -891,11 +1059,15 @@ function extensionForContentType(contentType, fallback = '.jpg') {
   return fallback;
 }
 
+async function loadSharp() {
+  const sharpModule = await import('sharp').catch(() => null);
+  return sharpModule?.default || sharpModule || null;
+}
+
 async function imageLooksUsable(filePath, role = 'preview', options = {}) {
   const stats = await fs.stat(filePath).catch(() => null);
   if (!stats || stats.size < (role === 'cover' ? 1100 : 700)) return false;
-  const sharpModule = await import('sharp').catch(() => null);
-  const sharp = sharpModule?.default || sharpModule;
+  const sharp = await loadSharp();
   if (!sharp) return true;
   try {
     const image = sharp(filePath);
@@ -918,6 +1090,29 @@ async function imageLooksUsable(filePath, role = 'preview', options = {}) {
   }
 }
 
+async function writeOptimizedImage(bytes, targetBasePath, contentType, options = {}) {
+  const role = options.role || 'preview';
+  const sharp = await loadSharp();
+  if (sharp) {
+    const spec = IMAGE_OUTPUT_SPECS[role] || IMAGE_OUTPUT_SPECS.preview;
+    const filePath = `${targetBasePath}.webp`;
+    await sharp(bytes, { animated: false })
+      .rotate()
+      .resize({
+        width: spec.width,
+        height: spec.height,
+        fit: 'inside',
+        withoutEnlargement: true,
+      })
+      .webp({ quality: spec.quality, effort: 4 })
+      .toFile(filePath);
+    return filePath;
+  }
+  const filePath = `${targetBasePath}${extensionForContentType(contentType)}`;
+  await fs.writeFile(filePath, bytes);
+  return filePath;
+}
+
 async function downloadImage(url, targetBasePath, options = {}) {
   const response = await fetchWithRetry(url, { signal: AbortSignal.timeout(45_000) }, 2);
   if (!response.ok) return null;
@@ -925,9 +1120,7 @@ async function downloadImage(url, targetBasePath, options = {}) {
   if (!contentType.toLowerCase().startsWith('image/')) return null;
   const bytes = Buffer.from(await response.arrayBuffer());
   if (bytes.length < 700) return null;
-  const extension = extensionForContentType(contentType);
-  const filePath = `${targetBasePath}${extension}`;
-  await fs.writeFile(filePath, bytes);
+  const filePath = await writeOptimizedImage(bytes, targetBasePath, contentType, options);
   if (!await imageLooksUsable(filePath, options.role || 'preview', options)) {
     await fs.unlink(filePath).catch(() => {});
     return null;
@@ -936,8 +1129,7 @@ async function downloadImage(url, targetBasePath, options = {}) {
 }
 
 async function imageDimensions(filePath) {
-  const sharpModule = await import('sharp').catch(() => null);
-  const sharp = sharpModule?.default || sharpModule;
+  const sharp = await loadSharp();
   if (!sharp) return {};
   const metadata = await sharp(filePath).metadata().catch(() => null);
   if (!metadata?.width || !metadata?.height) return {};
@@ -1017,8 +1209,12 @@ async function findBnfCover(reference) {
     if (!contentType.toLowerCase().startsWith('image/')) continue;
     const bytes = Buffer.from(await response.arrayBuffer());
     if (bytes.length < 1100) continue;
-    const filePath = `${path.join(coverDir, `${reference.key}-bnf-${isbn}`)}${extensionForContentType(contentType)}`;
-    await fs.writeFile(filePath, bytes);
+    const filePath = await writeOptimizedImage(
+      bytes,
+      path.join(coverDir, `${reference.key}-bnf-${isbn}`),
+      contentType,
+      { role: 'cover' },
+    );
     if (!await imageLooksUsable(filePath, 'cover')) {
       await fs.unlink(filePath).catch(() => {});
       continue;
@@ -1780,7 +1976,7 @@ async function fetchOembedPayload(reference, html = '') {
 async function enrichOembed(reference, html, assetCache) {
   const url = publicUrl(reference.url);
   if (!url) return null;
-  const cacheKey = `${reference.key}:${reference.version}:${url}`;
+  const cacheKey = `${MEDIA_PIPELINE_VERSION}:${reference.key}:${reference.version}:${url}`;
   const cached = assetCache.embeds?.[reference.key];
   if (cached?.cacheKey === cacheKey) {
     if (cached.embed) {
@@ -1815,7 +2011,7 @@ async function enrichOembed(reference, html, assetCache) {
 async function enrichOpenGraph(reference, html, assetCache) {
   const url = publicUrl(reference.url);
   if (!url || !html) return null;
-  const cacheKey = `${reference.key}:${reference.version}:${url}`;
+  const cacheKey = `${MEDIA_PIPELINE_VERSION}:${reference.key}:${reference.version}:${url}`;
   const cached = assetCache.openGraph?.[reference.key];
   if (cached?.cacheKey === cacheKey && cached.openGraph) {
     if (!cached.openGraph.image?.src || await assetPathExists(cached.openGraph.image)) {
@@ -1839,7 +2035,7 @@ async function enrichOpenGraph(reference, html, assetCache) {
 async function findWaybackArchive(reference, assetCache) {
   const url = publicUrl(reference.url);
   if (!url) return null;
-  const cacheKey = `${reference.key}:${reference.version}:${url}`;
+  const cacheKey = `${MEDIA_PIPELINE_VERSION}:${reference.key}:${reference.version}:${url}`;
   const cached = assetCache.archives?.[reference.key];
   if (cached?.cacheKey === cacheKey) {
     if (cached.archive) return cached.archive;
@@ -1899,7 +2095,7 @@ async function captureScreenshot(reference, tools, assetCache, options = {}) {
   const isPdf = looksLikePublicPdfUrl(url);
   const kind = options.kind || (isPdf ? 'pdf-screenshot' : 'screenshot');
   const cacheId = `${reference.key}:${kind}`;
-  const cacheKey = `${reference.key}:${reference.version}:${kind}:${url}`;
+  const cacheKey = `${MEDIA_PIPELINE_VERSION}:${reference.key}:${reference.version}:${kind}:${url}`;
   const cached = assetCache.screenshots?.[cacheId];
   if (cached?.cacheKey === cacheKey) {
     if (cached.asset?.src) {
@@ -2056,7 +2252,9 @@ function buildNoteSummary(notes) {
 function normalizeReference(item, context) {
   const data = item.data || {};
   const creators = Array.isArray(data.creators) ? data.creators : [];
-  const memoKeys = (data.collections || []).filter((key) => context.memoirByKey.has(key));
+  const memoKeys = (data.collections || [])
+    .filter((key) => context.memoirByZoteroKey.has(key))
+    .map((key) => context.memoirByZoteroKey.get(key).key);
   const memoNames = memoKeys.map((key) => context.memoirByKey.get(key).name);
   const attachments = context.attachmentsByParent.get(item.key) || [];
   const directNotes = context.notesByParent.get(item.key) || [];
@@ -2065,7 +2263,8 @@ function normalizeReference(item, context) {
   const title = normalizeSpace(data.title || data.shortTitle || 'Sans titre');
   const url = publicUrl(data.url);
   const reference = {
-    key: item.key,
+    key: context.referenceKey(item.key),
+    zoteroKey: item.key,
     version: item.version ?? data.version ?? null,
     itemType: data.itemType || 'document',
     typeLabel: TYPE_LABELS[data.itemType] || data.itemType || 'Reference',
@@ -2088,6 +2287,7 @@ function normalizeReference(item, context) {
     isbn: normalizeSpace(data.ISBN || ''),
     isbns: parseIsbns(data.ISBN),
     coverUrl: extractCoverUrl(data.extra),
+    physicalSize: extractPhysicalSize(data.extra),
     doi: normalizeSpace(data.DOI || ''),
     doiUrl: getDoiUrl(data.DOI || ''),
     url,
@@ -2097,6 +2297,8 @@ function normalizeReference(item, context) {
     tags: (data.tags || []).map((tag) => normalizeSpace(tag.tag)).filter(Boolean),
     memoirKeys: memoKeys,
     memoirNames: memoNames,
+    collectionKeys: memoKeys,
+    collectionNames: memoNames,
     sharedWith: memoNames,
     attachments: buildAttachmentSummary(attachments),
     notes: buildNoteSummary(directNotes),
@@ -2263,7 +2465,7 @@ function descendantCollections(rootCollection, activeCollections) {
   return descendants;
 }
 
-function yearDescriptor(rootCollection, year, activeCollections, items, sharedContext) {
+function collectionDescriptor(rootCollection, root, activeCollections, items, sharedContext) {
   const subcollections = descendantCollections(rootCollection, activeCollections)
     .filter((collection) => isSubcollectionName(collection.data?.name))
     .sort((left, right) => String(left.data?.name || '').localeCompare(String(right.data?.name || ''), 'fr'));
@@ -2271,18 +2473,20 @@ function yearDescriptor(rootCollection, year, activeCollections, items, sharedCo
   const memoirs = sourceCollections
     .sort((left, right) => String(left.data?.name || '').localeCompare(String(right.data?.name || ''), 'fr'))
     .map((collection) => ({
-      key: collection.key,
+      key: rootId(root.groupId, collection.key),
+      zoteroKey: collection.key,
       name: normalizeSpace(collection.data?.name || collection.key),
       slug: slugify(collection.data?.name || collection.key),
       zoteroUrl: collection.links?.alternate?.href || '',
     }));
   const memoirByKey = new Map(memoirs.map((memoir) => [memoir.key, memoir]));
+  const memoirByZoteroKey = new Map(memoirs.map((memoir) => [memoir.zoteroKey, memoir]));
   const selectedTopItems = items.filter((item) => (
     item?.key
     && !EXCLUDED_ITEM_TYPES.has(item.data?.itemType)
-    && (item.data?.collections || []).some((key) => memoirByKey.has(key))
+    && (item.data?.collections || []).some((key) => memoirByZoteroKey.has(key))
   ));
-  const context = { ...sharedContext, memoirByKey };
+  const context = { ...sharedContext, memoirByKey, memoirByZoteroKey };
   const references = selectedTopItems
     .map((item) => normalizeReference(item, context))
     .sort((left, right) => (
@@ -2290,7 +2494,7 @@ function yearDescriptor(rootCollection, year, activeCollections, items, sharedCo
       || left.key.localeCompare(right.key)
     ));
   return {
-    year,
+    root,
     rootCollection,
     memoirs,
     selectedTopItems,
@@ -2336,8 +2540,8 @@ function logCoverCoverage(references) {
   log(`Cover sources: ${sources || 'none'}.`);
 }
 
-function createYearCatalog(descriptor, metadata) {
-  const { references, memoirs, rootCollection, selectedTopItems, year } = descriptor;
+function createCollectionCatalog(descriptor, metadata) {
+  const { references, memoirs, rootCollection, selectedTopItems, root } = descriptor;
   const memoirsWithStats = memoirs.map((memoir) => computeMemoirStats(memoir, references));
   const sharedReferences = references
     .filter((reference) => reference.memoirKeys.length > 1)
@@ -2352,23 +2556,26 @@ function createYearCatalog(descriptor, metadata) {
       year: reference.year,
       memoirKeys: reference.memoirKeys,
       memoirNames: reference.memoirNames,
+      collectionKeys: reference.collectionKeys || reference.memoirKeys,
+      collectionNames: reference.collectionNames || reference.memoirNames,
       count: reference.memoirKeys.length,
     }));
   return {
     generatedAt: metadata.generatedAt,
+    physicalScale: Boolean(metadata.physicalScale),
     source: {
-      groupId: GROUP_ID,
+      groupId: metadata.groupId,
       groupName: selectedTopItems[0]?.library?.name || metadata.groupName,
       groupUrl: selectedTopItems[0]?.library?.links?.alternate?.href || metadata.groupUrl,
       rootCollectionKey: rootCollection.key,
-      rootCollectionName: year.label,
+      rootCollectionName: root.label,
       rootCollectionUrl: rootCollection.links?.alternate?.href || '',
-      rootId: year.id,
+      rootId: root.id,
       libraryVersion: metadata.libraryVersion,
-      yearId: year.id,
     },
     stats: {
       memoirCount: memoirsWithStats.length,
+      collectionCount: memoirsWithStats.length,
       referenceCount: references.length,
       sharedReferenceCount: sharedReferences.length,
       annotationCount: references.reduce((sum, reference) => sum + reference.annotations.count, 0),
@@ -2378,48 +2585,18 @@ function createYearCatalog(descriptor, metadata) {
     },
     layout: computeAtlasLayout(references, memoirs),
     memoirs: memoirsWithStats,
+    collections: memoirsWithStats,
     references,
     sharedReferences,
   };
 }
 
-async function main() {
-  await Promise.all([
-    fs.mkdir(dataDir, { recursive: true }),
-    fs.mkdir(catalogsDir, { recursive: true }),
-    fs.mkdir(coverDir, { recursive: true }),
-    fs.mkdir(previewDir, { recursive: true }),
-    fs.mkdir(screenshotDir, { recursive: true }),
-    fs.mkdir(fallbackDir, { recursive: true }),
-    fs.mkdir(cacheDir, { recursive: true }),
-  ]);
-
-  const assetCache = {
-    covers: {},
-    pageCovers: {},
-    embeds: {},
-    openGraph: {},
-    previews: {},
-    archives: {},
-    screenshots: {},
-    webMeta: {},
-    ...(await readJson(assetCacheFile, {})),
-  };
-  assetCache.covers ||= {};
-  assetCache.pageCovers ||= {};
-  assetCache.embeds ||= {};
-  assetCache.openGraph ||= {};
-  assetCache.previews ||= {};
-  assetCache.archives ||= {};
-  assetCache.screenshots ||= {};
-  assetCache.webMeta ||= {};
-  const zoteroCache = await readJson(zoteroCacheFile, {});
-
-  log(`Collecting Zotero group ${GROUP_ID}...`);
-  const [{ items: collections, libraryVersion: collectionVersion }, { items, libraryVersion: itemVersion }] = await timed('Zotero data loaded', () => (
+async function loadSourceDescriptors(source, zoteroCache) {
+  log(`Collecting Zotero group ${source.groupId}...`);
+  const [{ items: collections, libraryVersion: collectionVersion }, { items, libraryVersion: itemVersion }] = await timed(`Zotero group ${source.groupId} data loaded`, () => (
     Promise.all([
-      zoteroAllCached(zoteroCache, 'collections', '/collections', {}, 'collections'),
-      zoteroAllCached(zoteroCache, 'items', '/items', { include: 'data', includeTrashed: '0' }, 'items'),
+      zoteroAllCached(zoteroCache, source.groupId, 'collections', '/collections', {}, 'collections'),
+      zoteroAllCached(zoteroCache, source.groupId, 'items', '/items', { include: 'data', includeTrashed: '0' }, 'items'),
     ])
   ));
 
@@ -2428,16 +2605,19 @@ async function main() {
     .filter((collection) => (collection.data?.parentCollection || false) === false)
     .map((rootCollection) => ({
       rootCollection,
-      year: rootCollectionDescriptor(rootCollection),
+      root: rootCollectionDescriptor(rootCollection, source),
     }))
-    .filter(({ rootCollection, year }) => (
-      year
-      && (!ROOT_COLLECTION_FILTER || rootCollection.data?.name === ROOT_COLLECTION_FILTER || rootCollection.key === ROOT_COLLECTION_FILTER)
-    ))
-    .sort((left, right) => left.year.label.localeCompare(right.year.label, 'fr'));
+    .filter(({ root }) => root)
+    .sort((left, right) => left.root.label.localeCompare(right.root.label, 'fr'));
   if (!rootCollections.length) {
-    const suffix = ROOT_COLLECTION_FILTER ? ` matching ${ROOT_COLLECTION_FILTER}` : '';
-    throw new Error(`No Zotero root collection${suffix}`);
+    log(`No Zotero root collection found for group ${source.groupId}.`);
+    return {
+      source,
+      groupName: source.label || `Groupe Zotero ${source.groupId}`,
+      groupUrl: `https://www.zotero.org/groups/${source.groupId}`,
+      libraryVersion: Number(itemVersion || collectionVersion || 0) || null,
+      descriptors: [],
+    };
   }
 
   const attachmentsByParent = new Map();
@@ -2460,24 +2640,106 @@ async function main() {
       annotationsByAttachment.set(item.data.parentItem, list);
     }
   }
-  const sharedContext = { attachmentsByParent, notesByParent, annotationsByAttachment };
-  const descriptors = rootCollections.map(({ rootCollection, year }) => (
-    yearDescriptor(rootCollection, year, activeCollections, items, sharedContext)
-  )).filter((descriptor) => descriptor.memoirs.length || descriptor.references.length);
+
+  const sharedContext = {
+    attachmentsByParent,
+    notesByParent,
+    annotationsByAttachment,
+    referenceKey: (key) => scopedItemKey(source.groupId, key),
+  };
+  const descriptors = rootCollections
+    .map(({ rootCollection, root }) => collectionDescriptor(rootCollection, root, activeCollections, items, sharedContext))
+    .filter((descriptor) => descriptor.references.length > 0)
+    .map((descriptor) => ({
+      ...descriptor,
+      sourceMetadata: {
+        groupId: source.groupId,
+        groupLabel: source.label,
+        groupName: descriptor.selectedTopItems[0]?.library?.name || source.label || `Groupe Zotero ${source.groupId}`,
+        groupUrl: descriptor.selectedTopItems[0]?.library?.links?.alternate?.href || `https://www.zotero.org/groups/${source.groupId}`,
+        libraryVersion: Number(itemVersion || collectionVersion || 0) || null,
+      },
+    }));
+
+  for (const descriptor of descriptors) {
+    log(`Found ${descriptor.memoirs.length} collection(s) and ${descriptor.references.length} reference(s) for ${descriptor.root.label}.`);
+  }
+
+  return {
+    source,
+    groupName: descriptors[0]?.sourceMetadata.groupName || source.label || `Groupe Zotero ${source.groupId}`,
+    groupUrl: descriptors[0]?.sourceMetadata.groupUrl || `https://www.zotero.org/groups/${source.groupId}`,
+    libraryVersion: Number(itemVersion || collectionVersion || 0) || null,
+    descriptors,
+  };
+}
+
+async function prepareOutputDirectories() {
+  await fs.rm(dataDir, { recursive: true, force: true });
+  await Promise.all([
+    fs.mkdir(catalogsDir, { recursive: true }),
+    fs.mkdir(coverDir, { recursive: true }),
+    fs.mkdir(previewDir, { recursive: true }),
+    fs.mkdir(screenshotDir, { recursive: true }),
+    fs.mkdir(fallbackDir, { recursive: true }),
+    fs.mkdir(cacheDir, { recursive: true }),
+  ]);
+}
+
+async function main() {
+  await prepareOutputDirectories();
+
+  const assetCache = {
+    covers: {},
+    pageCovers: {},
+    embeds: {},
+    openGraph: {},
+    previews: {},
+    archives: {},
+    screenshots: {},
+    webMeta: {},
+    ...(await readJson(assetCacheFile, {})),
+  };
+  assetCache.covers ||= {};
+  assetCache.pageCovers ||= {};
+  assetCache.embeds ||= {};
+  assetCache.openGraph ||= {};
+  assetCache.previews ||= {};
+  assetCache.archives ||= {};
+  assetCache.screenshots ||= {};
+  assetCache.webMeta ||= {};
+  assetCache.physicalSizes ||= {};
+  const zoteroCache = await readJson(zoteroCacheFile, {});
+
+  const config = await loadZotscapeConfig();
+  const sourceResults = [];
+  for (const source of config.sources) {
+    sourceResults.push(await loadSourceDescriptors(source, zoteroCache));
+  }
+
+  const descriptors = sourceResults.flatMap((sourceResult) => sourceResult.descriptors);
   if (!descriptors.length) {
-    const suffix = ROOT_COLLECTION_FILTER ? ` matching ${ROOT_COLLECTION_FILTER}` : '';
-    throw new Error(`No Zotero root collection with usable subcollections${suffix}`);
+    throw new Error('No Zotero root collection with usable references.');
   }
   const uniqueReferenceByKey = new Map();
   for (const descriptor of descriptors) {
     for (const reference of descriptor.references) {
       if (!uniqueReferenceByKey.has(reference.key)) uniqueReferenceByKey.set(reference.key, reference);
     }
-    log(`Found ${descriptor.memoirs.length} subcollection(s) and ${descriptor.references.length} reference(s) for ${descriptor.year.label}.`);
   }
   const references = [...uniqueReferenceByKey.values()];
 
   log(`Enriching ${references.length} unique references across ${descriptors.length} root collection catalog(s).`);
+  if (config.physicalScale) {
+    log(`Enriching physical sizes with concurrency=${ENRICH_CONCURRENCY}...`);
+    await timed('Physical sizes enriched', () => mapLimit(references, ENRICH_CONCURRENCY, async (reference) => {
+      try {
+        reference.physicalSize = await enrichPhysicalSize(reference, assetCache);
+      } catch (error) {
+        log(`Physical size enrichment failed for ${reference.key}: ${error.message}`);
+      }
+    }));
+  }
   log(`Enriching covers and fallback cards with concurrency=${ENRICH_CONCURRENCY}...`);
   await timed('Covers and fallback cards enriched', () => mapLimit(references, ENRICH_CONCURRENCY, async (reference) => {
     try {
@@ -2561,62 +2823,80 @@ async function main() {
   }
 
   const generatedAt = new Date().toISOString();
-  const libraryVersion = Number(itemVersion || collectionVersion || 0) || null;
-  const allSelectedItems = descriptors.flatMap((descriptor) => descriptor.selectedTopItems);
-  const groupName = allSelectedItems[0]?.library?.name || 'EnsadNancy';
-  const groupUrl = allSelectedItems[0]?.library?.links?.alternate?.href || `https://www.zotero.org/groups/${GROUP_ID}`;
   const catalogs = descriptors.map((descriptor) => ({
     descriptor,
-    catalog: createYearCatalog(descriptor, {
+    catalog: createCollectionCatalog(descriptor, {
       generatedAt,
-      groupName,
-      groupUrl,
-      libraryVersion,
+      physicalScale: config.physicalScale,
+      groupId: descriptor.sourceMetadata.groupId,
+      groupName: descriptor.sourceMetadata.groupName,
+      groupUrl: descriptor.sourceMetadata.groupUrl,
+      libraryVersion: descriptor.sourceMetadata.libraryVersion,
     }),
   }));
   const referenceCollections = {};
   for (const { descriptor, catalog } of catalogs) {
-    const catalogPath = path.join(catalogsDir, `${descriptor.year.id}.json`);
+    const catalogPath = path.join(catalogsDir, `${safeFilePart(descriptor.root.id)}.json`);
     await writeJson(catalogPath, catalog);
     for (const reference of catalog.references) {
-      referenceCollections[reference.key] ||= [];
-      referenceCollections[reference.key].push(descriptor.year.id);
+      for (const lookupKey of referenceLookupKeys(reference)) {
+        referenceCollections[lookupKey] ||= [];
+        if (!referenceCollections[lookupKey].includes(descriptor.root.id)) {
+          referenceCollections[lookupKey].push(descriptor.root.id);
+        }
+      }
     }
     log(`Wrote ${path.relative(projectRoot, catalogPath)}.`);
   }
 
-  const defaultCatalog = catalogs[0].catalog;
   const collectionEntries = catalogs.map(({ descriptor, catalog }) => ({
-    id: descriptor.year.id,
-    label: descriptor.year.label,
-    slug: descriptor.year.slug,
-    catalog: `data/catalogs/${descriptor.year.id}.json`,
+    id: descriptor.root.id,
+    label: descriptor.root.label,
+    slug: descriptor.root.slug,
+    catalog: `data/catalogs/${safeFilePart(descriptor.root.id)}.json`,
+    groupId: descriptor.sourceMetadata.groupId,
+    groupLabel: descriptor.sourceMetadata.groupLabel,
+    groupName: descriptor.sourceMetadata.groupName,
     rootCollectionKey: descriptor.rootCollection.key,
     rootCollectionUrl: catalog.source.rootCollectionUrl,
     stats: catalog.stats,
     generatedAt: catalog.generatedAt,
   }));
+  const uniqueReferenceCount = new Set(
+    catalogs.flatMap(({ catalog }) => (catalog.references || []).map((reference) => reference.key)),
+  ).size;
+  const defaultEntry = collectionEntries.find((entry) => entry.id === config.defaultRoot) || collectionEntries[0];
   const catalogIndex = {
     generatedAt,
-    defaultRoot: catalogs[0].descriptor.year.id,
-    defaultYear: catalogs[0].descriptor.year.id,
-    group: {
-      id: GROUP_ID,
-      name: groupName,
-      url: groupUrl,
-      libraryVersion,
+    physicalScale: config.physicalScale,
+    defaultRoot: defaultEntry.id,
+    stats: {
+      referenceCount: uniqueReferenceCount,
     },
+    sources: sourceResults.map((sourceResult) => ({
+      groupId: sourceResult.source.groupId,
+      label: sourceResult.source.label,
+      name: sourceResult.groupName,
+      url: sourceResult.groupUrl,
+      libraryVersion: sourceResult.libraryVersion,
+    })),
     collections: collectionEntries,
-    years: collectionEntries,
     referenceCollections,
-    referenceYears: referenceCollections,
   };
 
   await writeJson(path.join(dataDir, 'catalog-index.json'), catalogIndex);
-  await writeJson(path.join(dataDir, 'catalog.json'), defaultCatalog);
   await writeJson(assetCacheFile, assetCache);
   await writeJson(zoteroCacheFile, zoteroCache);
-  log(`Wrote ${path.relative(projectRoot, path.join(dataDir, 'catalog-index.json'))} and latest catalog alias.`);
+  const audit = await auditData({ projectRoot });
+  if (!audit.ok) {
+    throw new Error(`Generated data audit failed:\n${audit.errors.join('\n')}`);
+  }
+  log(`Data audit passed: ${audit.catalogCount} catalog(s), ${audit.referenceCount} unique reference(s), ${audit.mediaCount} media asset(s).`);
+  if (PRUNE_MEDIA) {
+    const pruneResult = await pruneUnreferencedMedia({ projectRoot, referencedMedia: audit.referencedMedia });
+    log(`Pruned ${pruneResult.removed.length} unreferenced media file(s).`);
+  }
+  log(`Wrote ${path.relative(projectRoot, path.join(dataDir, 'catalog-index.json'))}.`);
 }
 
 main().catch((error) => {

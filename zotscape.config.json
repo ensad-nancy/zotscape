@@ -1,0 +1,17 @@
+{
+  "sources": [
+    {
+      "groupId": 6584095,
+      "label": "EnsadNancy"
+    },
+    {
+      "groupId": 5231865,
+      "label": "Acclimatements"
+    }
+  ],
+  "defaultRoot": {
+    "groupId": 6584095,
+    "collectionKey": "F5GTTQ2J"
+  },
+  "physicalScale": true
+}

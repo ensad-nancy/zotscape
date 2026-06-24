@@ -49,7 +49,10 @@ jobs:
           ZOTSCAPE_SCREENSHOT_CONCURRENCY: 2
           ZOTSCAPE_SCREENSHOT_ATTEMPT_LIMIT: 36
           ZOTSCAPE_WEB_CACHE_TTL_HOURS: 168
+          ZOTSCAPE_PRUNE_MEDIA: 1
+      - run: npm run audit:data
       - run: GITHUB_PAGES=true npm run build
+      - run: npm run smoke
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist

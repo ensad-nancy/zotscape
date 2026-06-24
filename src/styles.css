@@ -1,6 +1,7 @@
 :root {
   color-scheme: light;
-  font-family: Helvetica, Arial, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-sans: Helvetica, Arial, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: var(--font-sans);
   background: #f3efe7;
   color: #11120f;
   font-synthesis: none;
@@ -10,15 +11,11 @@
   --muted: #6e675d;
   --paper: #fbfbf5;
   --surface: #f3efe7;
-  --surface-gradient:
-    radial-gradient(circle at 12% 10%, rgba(255, 205, 137, 0.34), transparent 32%),
-    radial-gradient(circle at 86% 14%, rgba(167, 223, 112, 0.16), transparent 30%),
-    radial-gradient(circle at 68% 92%, rgba(255, 123, 89, 0.1), transparent 34%),
-    linear-gradient(135deg, #f8f1e5 0%, #edf1e8 54%, #f8eee8 100%);
   --line: #d1c8ba;
   --highlight: #f1e84d;
   --green: #a7df70;
   --coral: #ff7b59;
+  --accent: var(--coral);
   --blue: #304fd7;
   --shadow: 0 20px 50px rgba(17, 18, 15, 0.18);
   --header-height: 78px;
@@ -70,24 +67,7 @@ p {
   width: 100vw;
   height: 100vh;
   overflow: hidden;
-  background:
-    radial-gradient(ellipse at 14% 12%, rgba(255, 205, 137, 0.28), transparent 42%),
-    radial-gradient(ellipse at 88% 10%, rgba(167, 223, 112, 0.15), transparent 38%),
-    radial-gradient(ellipse at 62% 94%, rgba(255, 123, 89, 0.1), transparent 42%),
-    linear-gradient(135deg, #f8f1e5 0%, #edf1e8 54%, #f8eee8 100%);
-}
-
-.app-shell::before {
-  content: "";
-  position: absolute;
-  inset: -20%;
-  z-index: 0;
-  background:
-    radial-gradient(ellipse at 18% 28%, rgba(255, 205, 137, 0.22), transparent 34%),
-    radial-gradient(ellipse at 72% 40%, rgba(167, 223, 112, 0.15), transparent 36%),
-    radial-gradient(ellipse at 60% 82%, rgba(255, 123, 89, 0.1), transparent 34%);
-  filter: blur(72px);
-  pointer-events: none;
+  background: linear-gradient(135deg, #f8f1e5 0%, #edf1e8 58%, #f8eee8 100%);
 }
 
 .app-shell--empty {
@@ -125,11 +105,9 @@ p {
 
 .brand-link,
 .tools-toggle,
-.metric,
 .panel-head,
 .tool-chip,
 .reset-button,
-.media-load-button,
 .detail-actions,
 .annotation-head {
   display: flex;
@@ -138,7 +116,9 @@ p {
 
 .brand-link {
   flex: 0 0 auto;
-  gap: 7px;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
   padding: 0;
   color: var(--ink);
   background: transparent;
@@ -158,10 +138,10 @@ p {
 }
 
 .atlas-title h1 {
-  font-size: 25px;
+  font-size: 18px;
   line-height: 1;
   font-weight: 950;
-  letter-spacing: -0.055em;
+  letter-spacing: 0;
 }
 
 .collection-selector {
@@ -345,7 +325,6 @@ p {
 .tool-field select:focus-visible,
 .tool-chip:focus-visible,
 .reset-button:focus-visible,
-.media-load-button:focus-visible,
 .detail-actions a:focus-visible {
   outline: 3px solid rgba(48, 79, 215, 0.28);
   outline-offset: 3px;
@@ -545,7 +524,7 @@ p {
   font-size: 11px;
   font-weight: 950;
   line-height: 1;
-  letter-spacing: -0.02em;
+  letter-spacing: 0;
   text-transform: none;
   transform: rotate(-5deg);
 }
@@ -581,16 +560,19 @@ p {
   );
   font-size: 10px;
   font-style: italic;
-  letter-spacing: -0.08em;
+  letter-spacing: 0;
   text-transform: uppercase;
   transform: rotate(-7deg);
 }
 
 .object-sticker--shared {
+  min-width: 24px;
+  min-height: 24px;
   padding: 3px 5px;
   background: #fbfbf5;
   border-radius: 999px;
   font-size: 15px;
+  font-style: normal;
   transform: rotate(7deg);
 }
 
@@ -1348,9 +1330,6 @@ p {
   flex-wrap: wrap;
   align-items: center;
   gap: 6px 12px;
-}
-
-.reference-list-meta {
   color: var(--muted);
   font-size: 11px;
   font-weight: 750;
@@ -1919,20 +1898,6 @@ p {
   flex-wrap: wrap;
 }
 
-.media-load-button {
-  width: fit-content;
-  gap: 8px;
-  min-height: 38px;
-  padding: 0 12px;
-  color: var(--ink);
-  background: var(--green);
-  border: 0;
-  border-radius: 5px;
-  cursor: pointer;
-  font-size: 13px;
-  font-weight: 900;
-}
-
 .detail-actions a {
   display: inline-flex;
   align-items: center;
@@ -2318,13 +2283,10 @@ p {
     align-items: center;
   }
 
-  .brand-link {
-    display: none;
-  }
-
   .atlas-heading {
     min-width: 0;
     flex: 1 1 auto;
+    gap: 10px;
   }
 
   .atlas-title {
@@ -2335,7 +2297,7 @@ p {
   }
 
   .atlas-title h1 {
-    font-size: 20px;
+    font-size: 15px;
   }
 
   .collection-selector-menu {
