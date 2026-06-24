@@ -46,15 +46,39 @@ async function readJson(filePath) {
   return JSON.parse(await fs.readFile(filePath, 'utf8'));
 }
 
+function normalizeBasePath(value) {
+  const base = value.startsWith('/') ? value : `/${value}`;
+  return base.endsWith('/') ? base : `${base}/`;
+}
+
+async function detectBuildBasePath() {
+  const html = await fs.readFile(path.join(distDir, 'index.html'), 'utf8');
+  const paths = [...html.matchAll(/\b(?:href|src)=["']([^"']+)["']/giu)].map(([, value]) => value);
+  const assetPath = paths.find((value) => value.startsWith('/') && /\/(?:assets|data)\//u.test(value));
+  if (!assetPath) return '/';
+  const marker = /\/(?:assets|data)\//u.exec(assetPath);
+  if (!marker) return '/';
+  return normalizeBasePath(assetPath.slice(0, marker.index + 1));
+}
+
+function requestPathForDist(pathname, basePath) {
+  const decodedPath = decodeURIComponent(pathname);
+  if (basePath !== '/' && decodedPath.startsWith(basePath)) {
+    return decodedPath.slice(basePath.length).replace(/^\/+/u, '');
+  }
+  return decodedPath.replace(/^\/+/u, '');
+}
+
 async function startStaticServer() {
   await fs.access(path.join(distDir, 'index.html'));
+  const basePath = await detectBuildBasePath();
   const server = http.createServer(async (request, response) => {
     try {
       const url = new URL(request.url || '/', 'http://127.0.0.1');
-      const cleanPath = decodeURIComponent(url.pathname).replace(/^\/+/u, '');
+      const cleanPath = requestPathForDist(url.pathname, basePath);
       const requestedPath = cleanPath ? path.join(distDir, cleanPath) : path.join(distDir, 'index.html');
       const resolvedPath = path.resolve(requestedPath);
-      if (!resolvedPath.startsWith(distDir)) {
+      if (resolvedPath !== distDir && !resolvedPath.startsWith(`${distDir}${path.sep}`)) {
         response.writeHead(403);
         response.end('Forbidden');
         return;
@@ -78,7 +102,8 @@ async function startStaticServer() {
   });
   return {
     server,
-    url: `http://127.0.0.1:${server.address().port}/`,
+    basePath,
+    url: `http://127.0.0.1:${server.address().port}${basePath}`,
   };
 }
 
@@ -101,6 +126,28 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+async function waitForAppSelector(page, selector, label, errors, failedResponses) {
+  try {
+    await page.waitForSelector(selector, { timeout: 10_000 });
+  } catch (error) {
+    const state = await page.evaluate(() => ({
+      title: document.title,
+      url: window.location.href,
+      bodyText: document.body.textContent?.replace(/\s+/gu, ' ').trim().slice(0, 500) || '',
+    })).catch(() => null);
+    const details = [
+      `${label} did not render ${selector}.`,
+      state ? `Page: ${state.url}` : null,
+      state?.title ? `Title: ${state.title}` : null,
+      state?.bodyText ? `Body: ${state.bodyText}` : null,
+      failedResponses.length ? `Failed responses:\n${failedResponses.join('\n')}` : null,
+      errors.length ? `Console/page errors:\n${errors.join('\n')}` : null,
+      error.message,
+    ].filter(Boolean);
+    throw new Error(details.join('\n'));
+  }
+}
+
 async function main() {
   const index = await readJson(path.join(distDir, 'data', 'catalog-index.json'));
   const firstCatalogEntry = index.collections?.[0];
@@ -109,18 +156,24 @@ async function main() {
   const deepLinkReference = firstCatalog.references?.find((reference) => reference?.title && reference?.key);
   assert(deepLinkReference, `No reference found in ${firstCatalogEntry.catalog}.`);
 
-  const { server, url: baseUrl } = await startStaticServer();
+  const { server, url: baseUrl, basePath } = await startStaticServer();
   const browser = await launchBrowser();
   const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
   const errors = [];
+  const failedResponses = [];
   page.on('console', (message) => {
     if (message.type() === 'error') errors.push(message.text());
   });
   page.on('pageerror', (error) => errors.push(error.message));
+  page.on('response', (response) => {
+    if (response.status() >= 400) {
+      failedResponses.push(`${response.status()} ${response.url()}`);
+    }
+  });
 
   try {
     await page.goto(baseUrl, { waitUntil: 'load' });
-    await page.waitForSelector('.atlas-object-main', { timeout: 10_000 });
+    await waitForAppSelector(page, '.atlas-object-main', 'Root page', errors, failedResponses);
     const rootState = await page.evaluate(() => ({
       objects: document.querySelectorAll('.atlas-object-main').length,
       title: document.querySelector('.atlas-title h1')?.textContent.trim() || '',
@@ -131,7 +184,7 @@ async function main() {
     assert(!rootState.hasBrandText, 'Header brand link should expose only the pictogram visually.');
 
     await page.getByRole('button', { name: 'Vue liste' }).click();
-    await page.waitForSelector('.reference-list-row', { timeout: 10_000 });
+    await waitForAppSelector(page, '.reference-list-row', 'List view', errors, failedResponses);
     const listRows = await page.locator('.reference-list-row').count();
     assert(listRows > 0, 'List view rendered no rows.');
 
@@ -143,7 +196,7 @@ async function main() {
 
     const deepLinkUrl = `${baseUrl}#${referenceHashPath(deepLinkReference)}?root=all`;
     await page.goto(deepLinkUrl, { waitUntil: 'load' });
-    await page.waitForSelector('.detail-panel', { timeout: 10_000 });
+    await waitForAppSelector(page, '.detail-panel', 'Deep link', errors, failedResponses);
     const deepLinkState = await page.evaluate((expectedTitle) => {
       const visibleLinks = [...document.querySelectorAll('a[href]')].filter((link) => {
         const rect = link.getBoundingClientRect();
@@ -164,8 +217,10 @@ async function main() {
     assert(deepLinkState.badExternalLinks.length === 0, `External links missing target/rel: ${deepLinkState.badExternalLinks.join(', ')}`);
 
     assert(errors.length === 0, `Browser console/page errors:\n${errors.join('\n')}`);
+    assert(failedResponses.length === 0, `HTTP errors while running smoke:\n${failedResponses.join('\n')}`);
     console.log(JSON.stringify({
       ok: true,
+      basePath,
       rootObjects: rootState.objects,
       listRows,
       filteredRows,
