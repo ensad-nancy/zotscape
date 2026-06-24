@@ -54,6 +54,8 @@ La collecte parallélise les pages Zotero, les enrichissements médias, les mesu
 
 ## Déploiement
 
+[![Build and deploy](https://github.com/ensad-nancy/zotscape/actions/workflows/pages.yml/badge.svg)](https://github.com/ensad-nancy/zotscape/actions/workflows/pages.yml)
+
 GitHub Actions collecte les données, restaure le cache des enrichissements, construit l’application et la publie sur GitHub Pages à chaque push sur `main` et une fois par jour.
 
 Les clés API de production sont enregistrées dans les secrets GitHub Actions.

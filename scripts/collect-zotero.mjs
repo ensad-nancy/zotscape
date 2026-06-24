@@ -2078,7 +2078,17 @@ async function loadScreenshotTools() {
       import('playwright'),
       import('sharp').catch(() => null),
     ]);
-    const browser = await chromium.launch({ headless: true });
+    let browser = null;
+    let launchError = null;
+    for (const options of [{ headless: true }, { channel: 'chrome', headless: true }, { channel: 'msedge', headless: true }]) {
+      try {
+        browser = await chromium.launch(options);
+        break;
+      } catch (error) {
+        launchError ||= error;
+      }
+    }
+    if (!browser) throw launchError;
     return {
       browser,
       sharp: sharpModule?.default || sharpModule,
@@ -2162,6 +2172,12 @@ async function captureScreenshot(reference, tools, assetCache, options = {}) {
 }
 
 async function captureReferencePreview(reference, screenshotTools, assetCache) {
+  if (reference.screenshot) return true;
+  if (!reference.previewStatus?.blocked && shouldCaptureVisual(reference)) {
+    reference.screenshot = await captureScreenshot(reference, screenshotTools, assetCache);
+    if (reference.screenshot) return true;
+  }
+  if (reference.archive?.asset) return true;
   if (reference.archive?.url) {
     const asset = await captureScreenshot(reference, screenshotTools, assetCache, {
       url: reference.archive.url,
@@ -2172,9 +2188,7 @@ async function captureReferencePreview(reference, screenshotTools, assetCache) {
       return true;
     }
   }
-  if (!shouldCaptureVisual(reference)) return false;
-  reference.screenshot = await captureScreenshot(reference, screenshotTools, assetCache);
-  return Boolean(reference.screenshot);
+  return false;
 }
 
 async function capturePreviewFallbacks(candidates, screenshotTools, assetCache) {
@@ -2363,8 +2377,8 @@ function chooseCardAsset(reference) {
   return reference.cover
     || reference.embed?.thumbnail
     || reference.openGraph?.image
-    || reference.archive?.asset
     || reference.screenshot
+    || reference.archive?.asset
     || reference.fallback;
 }
 
@@ -2379,9 +2393,35 @@ async function normalizeReferenceAssets(reference) {
 function shouldCaptureVisual(reference) {
   if (!reference.url) return false;
   if (COVER_OBJECT_TYPES.has(reference.itemType)) return false;
-  if (reference.cover || reference.embed?.thumbnail || reference.openGraph?.image || reference.archive?.asset) return false;
+  if (reference.cover || reference.embed?.thumbnail || reference.openGraph?.image || reference.screenshot) return false;
   if (reference.publicPdfUrl) return !reference.cover;
   return WEB_CAPTURE_TYPES.has(reference.itemType) || !reference.cover;
+}
+
+async function cachedScreenshotAsset(reference, assetCache, kind) {
+  const ids = [
+    `${reference.key}:${kind}`,
+    reference.zoteroKey ? `${reference.zoteroKey}:${kind}` : '',
+  ].filter(Boolean);
+  for (const id of ids) {
+    const cached = assetCache.screenshots?.[id];
+    if (!cached?.asset?.src) continue;
+    const filePath = path.join(publicRoot, cached.asset.src);
+    if (!await exists(filePath)) continue;
+    return ensureAssetDimensions(cached.asset);
+  }
+  return null;
+}
+
+async function hydrateCachedScreenshotAssets(reference, assetCache) {
+  if (reference.archive?.url && !reference.archive.asset) {
+    reference.archive.asset = await cachedScreenshotAsset(reference, assetCache, 'archive');
+  }
+  if (!reference.screenshot) {
+    const primaryKind = looksLikePublicPdfUrl(reference.url) ? 'pdf-screenshot' : 'screenshot';
+    reference.screenshot = await cachedScreenshotAsset(reference, assetCache, primaryKind)
+      || await cachedScreenshotAsset(reference, assetCache, primaryKind === 'screenshot' ? 'pdf-screenshot' : 'screenshot');
+  }
 }
 
 function objectSize(reference, index) {
@@ -2786,6 +2826,10 @@ async function main() {
     }
   }));
 
+  await timed('Cached screenshots restored', () => mapLimit(references, ENRICH_CONCURRENCY, (reference) => (
+    hydrateCachedScreenshotAssets(reference, assetCache)
+  )));
+
   const screenshotTools = await loadScreenshotTools();
   if (screenshotTools) {
     const captureCandidates = references.filter((reference) => (
@@ -2794,6 +2838,7 @@ async function main() {
       && !reference.cover
       && !reference.embed?.thumbnail
       && !reference.openGraph?.image
+      && !reference.screenshot
     ));
     log(`Capturing up to ${SCREENSHOT_LIMIT} final preview fallback(s), ${SCREENSHOT_ATTEMPT_LIMIT} attempt(s), concurrency=${SCREENSHOT_CONCURRENCY}...`);
     const { attempted, captured } = await timed('Screenshots captured', () => (

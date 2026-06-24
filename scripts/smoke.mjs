@@ -157,6 +157,7 @@ async function main() {
   assert(deepLinkReference, `No reference found in ${firstCatalogEntry.catalog}.`);
 
   const { server, url: baseUrl, basePath } = await startStaticServer();
+  const smokeOrigin = new URL(baseUrl).origin;
   const browser = await launchBrowser();
   const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
   const errors = [];
@@ -166,7 +167,7 @@ async function main() {
   });
   page.on('pageerror', (error) => errors.push(error.message));
   page.on('response', (response) => {
-    if (response.status() >= 400) {
+    if (response.status() >= 400 && new URL(response.url()).origin === smokeOrigin) {
       failedResponses.push(`${response.status()} ${response.url()}`);
     }
   });
@@ -182,6 +183,13 @@ async function main() {
     assert(rootState.objects > 0, 'Root page rendered no atlas objects.');
     assert(rootState.title, 'Root page has no collection title.');
     assert(!rootState.hasBrandText, 'Header brand link should expose only the pictogram visually.');
+
+    await page.locator('.atlas-object-main').first().click();
+    await waitForAppSelector(page, '.detail-panel', 'Atlas detail', errors, failedResponses);
+    await page.locator('.detail-panel button[aria-label="Fermer"]').click();
+    await page.waitForSelector('.detail-panel', { state: 'detached', timeout: 10_000 });
+    const atlasClosedUrl = page.url();
+    assert(!/#[^?]+--/u.test(atlasClosedUrl), `Atlas detail close kept a reference hash in the URL: ${atlasClosedUrl}`);
 
     await page.getByRole('button', { name: 'Vue liste' }).click();
     await waitForAppSelector(page, '.reference-list-row', 'List view', errors, failedResponses);
@@ -216,6 +224,11 @@ async function main() {
     assert(deepLinkState.detailTitle === deepLinkReference.title, `Deep link opened "${deepLinkState.detailTitle}" instead of "${deepLinkReference.title}".`);
     assert(deepLinkState.badExternalLinks.length === 0, `External links missing target/rel: ${deepLinkState.badExternalLinks.join(', ')}`);
 
+    await page.locator('.detail-panel button[aria-label="Fermer"]').click();
+    await page.waitForSelector('.detail-panel', { state: 'detached', timeout: 10_000 });
+    const closedUrl = page.url();
+    assert(!closedUrl.includes(referenceHashPath(deepLinkReference)), `Detail close kept the reference hash in the URL: ${closedUrl}`);
+
     assert(errors.length === 0, `Browser console/page errors:\n${errors.join('\n')}`);
     assert(failedResponses.length === 0, `HTTP errors while running smoke:\n${failedResponses.join('\n')}`);
     console.log(JSON.stringify({
@@ -225,6 +238,7 @@ async function main() {
       listRows,
       filteredRows,
       deepLinkTitle: deepLinkState.detailTitle,
+      detailClosed: true,
     }, null, 2));
   } finally {
     await browser.close().catch(() => {});

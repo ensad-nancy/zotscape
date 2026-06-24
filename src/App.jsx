@@ -1292,6 +1292,8 @@ function MiniMap({ items, layout, activeKey, transformState, viewport, onNavigat
 }
 
 function DetailPanel({ reference, suggestions, onSelect, onCollectionSelect, onClose, suspended }) {
+  const closeRequestedRef = useRef(false);
+
   useEffect(() => {
     if (!reference || suspended) return undefined;
     const handleKey = (event) => {
@@ -1300,6 +1302,19 @@ function DetailPanel({ reference, suggestions, onSelect, onCollectionSelect, onC
     window.addEventListener('keydown', handleKey);
     return () => window.removeEventListener('keydown', handleKey);
   }, [onClose, reference, suspended]);
+
+  useEffect(() => {
+    closeRequestedRef.current = false;
+  }, [reference?.key]);
+
+  const requestClose = (event) => {
+    if (event?.type === 'pointerdown' && event.button !== 0) return;
+    event?.preventDefault();
+    event?.stopPropagation();
+    if (closeRequestedRef.current) return;
+    closeRequestedRef.current = true;
+    onClose();
+  };
 
   if (!reference) return null;
   const href = sourceHref(reference);
@@ -1316,7 +1331,7 @@ function DetailPanel({ reference, suggestions, onSelect, onCollectionSelect, onC
   return (
     <aside className={`detail-panel${showMedia ? '' : ' detail-panel--no-media'}`} role="dialog" aria-modal="false" aria-label={reference.title}>
       <div className="detail-panel-head">
-        <button className="icon-button" type="button" onClick={onClose} aria-label="Fermer">
+        <button className="icon-button detail-close-button" type="button" onPointerDown={requestClose} onClick={requestClose} aria-label="Fermer">
           <X size={20} />
         </button>
       </div>
@@ -2041,10 +2056,6 @@ export default function App() {
   function closeReference() {
     if (!selectedReference) return;
     setSelectedReference(null);
-    if (window.history.state?.zotscapeDetailEntry) {
-      window.history.back();
-      return;
-    }
     writeAppUrl({
       reference: null,
       state: currentUrlState(),
