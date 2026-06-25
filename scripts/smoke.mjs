@@ -51,10 +51,6 @@ function isStaticSmokeReference(reference) {
   );
 }
 
-function referenceButtonLabel(reference) {
-  return `${reference.title}, ${reference.creatorsLabel || 'Auteur inconnu'}`;
-}
-
 async function readJson(filePath) {
   return JSON.parse(await fs.readFile(filePath, 'utf8'));
 }
@@ -161,6 +157,42 @@ async function waitForAppSelector(page, selector, label, errors, failedResponses
   }
 }
 
+async function clickVisibleStaticAtlasObject(page) {
+  const target = await page.evaluate(() => {
+    const viewportPadding = 8;
+    const candidates = [...document.querySelectorAll('.atlas-object--cover .atlas-object-main')]
+      .map((button) => {
+        const rect = button.getBoundingClientRect();
+        const x = rect.left + rect.width / 2;
+        const y = rect.top + rect.height / 2;
+        const hit = document.elementFromPoint(x, y);
+        const visible = (
+          rect.width > 0
+          && rect.height > 0
+          && x >= viewportPadding
+          && y >= viewportPadding
+          && x <= window.innerWidth - viewportPadding
+          && y <= window.innerHeight - viewportPadding
+          && (button === hit || button.contains(hit))
+        );
+        return visible
+          ? {
+            x,
+            y,
+            area: rect.width * rect.height,
+            label: button.getAttribute('aria-label') || '',
+          }
+          : null;
+      })
+      .filter(Boolean)
+      .sort((left, right) => right.area - left.area);
+    return candidates[0] || null;
+  });
+  assert(target, 'No visible static cover atlas object is available for the atlas click smoke test.');
+  await page.mouse.click(target.x, target.y);
+  return target;
+}
+
 async function main() {
   const index = await readJson(path.join(distDir, 'data', 'catalog-index.json'));
   const firstCatalogEntry = index.collections?.[0];
@@ -198,7 +230,7 @@ async function main() {
     assert(rootState.title, 'Root page has no collection title.');
     assert(!rootState.hasBrandText, 'Header brand link should expose only the pictogram visually.');
 
-    await page.getByRole('button', { name: referenceButtonLabel(deepLinkReference) }).click();
+    const atlasTarget = await clickVisibleStaticAtlasObject(page);
     await waitForAppSelector(page, '.detail-panel', 'Atlas detail', errors, failedResponses);
     await page.locator('.detail-panel button[aria-label="Fermer"]').click();
     await page.waitForSelector('.detail-panel', { state: 'detached', timeout: 10_000 });
@@ -249,6 +281,7 @@ async function main() {
       ok: true,
       basePath,
       rootObjects: rootState.objects,
+      atlasClickTitle: atlasTarget.label,
       listRows,
       filteredRows,
       deepLinkTitle: deepLinkState.detailTitle,
